@@ -1,0 +1,76 @@
+# 声纹识别：由 NAS 上的 xiaoqi-voiceprint 服务提供（CAM++，登记音频来自管理页）
+voiceprint:
+  url: http://xiaoqi-voiceprint:8096/voiceprint/identify?key=xiaoqi
+  similarity_threshold: 0.45
+  speakers:
+    # 格式：人员id,称呼,和你的关系；id 在声纹管理页添加人员后生成
+    - "p_xxxxxxxx,示例称呼,家里的男主人"
+
+# xiaozhi-esp32-server 覆盖配置（只写需要覆盖的项，其余用镜像自带 config.yaml）
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # ⚠️ 占位示例，换成你自己 NAS 的地址
+  websocket: ws://192.168.1.100:8000/xiaozhi/v1/
+
+# 只保留真正可用、且不会卡住的工具（web_search 没有 Tavily key、get_weather 的
+# 公共 key 已 401，两者都会让一轮对话白等 5~24 秒）
+Intent:
+  function_call:
+    type: function_call
+    functions:
+      - change_role
+      - get_news_from_newsnow
+      - play_music
+      - get_weather
+
+plugins:
+  get_weather:
+    # wttr.in 版插件只需要默认城市，不再需要 api_host / api_key
+    default_location: "北京"
+
+selected_module:
+  VAD: SileroVAD
+  ASR: SherpaASR
+  LLM: DeepSeekLLM
+  TTS: EdgeTTS
+  Memory: nomem
+  Intent: function_call
+
+ASR:
+  SherpaASR:
+    type: sherpa_onnx_local
+    model_dir: models/sensevoice
+    output_dir: tmp/
+    model_type: sense_voice
+    # LX06 送上来是 16k 单声道，反正常用中文
+    language: zh
+
+LLM:
+  DeepSeekLLM:
+    type: openai
+    model_name: deepseek-chat
+    url: https://api.deepseek.com
+    # ⚠️ 换成你自己的 DeepSeek Key（或用环境变量注入）
+    api_key: "sk-请替换为你的DeepSeekKey"
+
+prompt: |
+  你是家里的小助手，叫小七，住在客厅的小爱音箱里。
+  这是在跟人面对面说话，不是在写字：只说中文，口语化，不要 Markdown、不要列表、不要表情符号。
+
+  说话节奏很重要，必须遵守：
+  1. 每次回答控制在 1~3 句，每句不超过 25 个字，句子之间用句号断开。
+  2. 先给最直接的答案，再用一句补充。想展开就停住，等用户问"详细说说"。
+  3. 绝不要输出网址、括号链接、<a> 标签、HTML；提到出处只用口头说"有个科普网站"这类说法。
+  4. 用户的话是语音识别出来的，可能有同音错字、英文单词被听错（比如"DeepSeek"被听成"deepepick honey"）。
+     遇到不存在的词时，按最可能的意思理解并直接回答，不要反问"这是什么软件"；实在猜不到再简短问一句。
+  5. 不确定就说不知道，不要编。
+
+# 关闭用不到的重型能力，省 CPU
+VLLM:
+  ChatGLMVLLM:
+    type: openai
+    model_name: ""
+    url: ""
+    api_key: ""

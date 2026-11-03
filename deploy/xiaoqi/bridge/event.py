@@ -1,0 +1,758 @@
+import asyncio
+import concurrent.futures
+import re
+import shlex
+import threading
+import time
+
+from config import APP_CONFIG
+from xiaozhi.services.audio.stream import (
+    GlobalStream,
+    rec_start as _rec_start,
+    rec_stop as _rec_stop,
+)
+from xiaozhi.ref import (
+    get_audio_codec,
+    get_kws,
+    get_music,
+    get_speaker,
+    get_vad,
+    get_xiaoai,
+    get_xiaozhi,
+    set_speech_frames,
+)
+from xiaozhi.services.audio.stream import GlobalStream
+from xiaozhi.services.protocols.typing import AbortReason, DeviceState, ListeningMode
+from xiaozhi.services.audio.health import HEALTH
+from xiaozhi.utils.base import get_env
+
+
+def get_vad_setting(key, default):
+    return APP_CONFIG.get("vad", {}).get(key, default)
+
+
+def get_barge_in_setting(key, default):
+    return APP_CONFIG.get("barge_in", {}).get(key, default)
+
+
+DEFAULT_EXIT_WORDS = ("拜拜", "再见", "退出", "退下", "没事了", "不用了", "结束对话", "bye", "goodbye")
+# Exit words that mean nothing but goodbye: opening an utterance they end the
+# conversation even when more follows.
+_GOODBYES = ("拜拜", "再见", "bye", "goodbye")
+# Said around an exit word without changing what it means.
+_EXIT_FILLERS = ("你好", "您好", "好的", "好吧", "好", "行", "嗯", "哦", "那", "那就",
+                 "谢谢", "谢了", "没事", "不用", "ok", "okay")
+_PARTICLES = "吧啦了呀啊哈哦喔嘛呗"
+_CLAUSE_BREAKS = re.compile(r"[，。！？、；：,.!?;:…]+")
+
+
+def _plain(text):
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
+def _bye(plain):
+    """"Bye bye" as the recognizer spells it ("拜 by", "拜e bye", "Goode bye")."""
+    plain = re.sub(r"goode?(?=by)", "", plain)
+    return re.sub(r"(?:拜e?|bye?){2,}", "拜拜", plain)
+
+
+def _exit_list(words):
+    return sorted({_bye(w) for w in map(_plain, words) if w}, key=len, reverse=True)
+
+
+def _strip_exit_tail(rest, exits):
+    """Drop exit words, fillers and particles from the end of `rest`; returns
+    the exit word said last (None if there was none) and what is left."""
+    found = None
+    while rest:
+        word = next((w for w in exits if rest.endswith(w)), None)
+        if word:
+            found = found or word
+        else:
+            word = next((w for w in _EXIT_FILLERS if rest.endswith(w)), None)
+            if not word and rest[-1] in _PARTICLES:
+                word = rest[-1]
+            if not word:
+                break
+        rest = rest[: -len(word)]
+    return found, rest
+
+
+def _names(keywords):
+    names = {k for k in map(_plain, keywords) if k}
+    return names | {k[i:] for k in names for i in range(len(k) - 1)}  # 小七 for 你好小七
+
+
+def _strip_leading(rest, names):
+    leading = sorted(names | set(_EXIT_FILLERS), key=len, reverse=True)
+    while rest:
+        word = next((w for w in leading if rest.startswith(w)), None)
+        if not word:
+            break
+        rest = rest[len(word):]
+    return rest
+
+
+def match_exit_words(text, words, keywords=()):
+    """The exit word `text` asks to end the conversation with, or None.
+
+    Only when that is all it says: "拜拜", "好的，谢谢，再见", "你好小七，拜拜".
+    In the follow-up window the wake word reaches the recognizer too, at times
+    misheard ("你好小琪", "亲"), and after a barge-in the end of "七" can come
+    along. So at most one character outside the wake words may be left over;
+    "关灯，拜拜" or "用英语怎么说再见" go to the server as usual.
+    """
+    found, rest = _strip_exit_tail(_bye(_plain(text)), _exit_list(words))
+    if not found:
+        return None
+    names = _names(keywords)
+    rest = _strip_leading(rest, names)
+    name_chars = set("".join(names))
+    return found if sum(ch not in name_chars for ch in rest) <= 1 else None
+
+
+def match_exit_intent(text, words, keywords=()):
+    """How `text` asks to end the conversation: ("now", word),
+    ("after_answer", word) or (None, None).
+
+    now: it says nothing else (match_exit_words), or a goodbye opens it and the
+    rest went to someone else ("拜拜，15加12已经27天没换水了").
+    after_answer: the server answers first, then the conversation ends instead
+    of listening again. A goodbye closing it ("关灯，拜拜"), after a wake word
+    misheard beyond repair ("你好傻次，拜拜", "再师拜拜"), or another exit word
+    opening it ("不用了，帮我把灯关掉").
+    "用英语怎么说再见" or "再见用英语怎么说" are not exits.
+    """
+    word = match_exit_words(text, words, keywords)
+    if word:
+        return "now", word
+    names = _names(keywords)
+    clauses = [c for c in _CLAUSE_BREAKS.split(str(text)) if _strip_leading(_plain(c), names)]
+    if len(clauses) > 1:
+        word = match_exit_words(clauses[0], words, keywords)
+        if word:
+            return ("now" if word in _exit_list(_GOODBYES) else "after_answer"), word
+        word = match_exit_words(clauses[-1], words, keywords)
+        if word:
+            return "after_answer", word
+    found, rest = _strip_exit_tail(_bye(_plain(text)), _exit_list(words))
+    # A misheard wake word keeps its length in characters ("你好傻次").
+    longest = max((sum(not ch.isascii() for ch in _plain(k)) for k in keywords), default=0)
+    if found and rest and len(rest) <= longest:
+        return "after_answer", found
+    return None, None
+
+
+def _exit_config():
+    wakeup = APP_CONFIG.get("wakeup", {})
+    return wakeup.get("exit_words", DEFAULT_EXIT_WORDS), wakeup.get("keywords", ())
+
+
+def exit_word(text):
+    return match_exit_words(text, *_exit_config())
+
+
+def exit_intent(text):
+    return match_exit_intent(text, *_exit_config())
+
+
+class Step:
+    idle = "idle"
+    on_interrupt = "on_interrupt"
+    on_wakeup = "on_wakeup"
+    on_barge_in = "on_barge_in"
+    on_exit_words = "on_exit_words"
+    on_tts_start = "on_tts_start"
+    on_tts_end = "on_tts_end"
+    on_speech = "on_speech"
+    on_silence = "on_silence"
+    on_stt = "on_stt"
+
+
+class __EventManager:
+    def __init__(self):
+        self.session_id = 0
+        self.current_step = Step.idle
+        self.next_step_future = None
+        self.next_step_loop = None
+        self.session_future = None
+        self.state_lock = threading.Lock()
+        # After a barge-in: where the keyword (roughly) ended and where
+        # listening starts.
+        self.keyword_at = None
+        self.listen_from = None
+        # The last thing said ends the conversation once it is answered.
+        self.exit_after_answer = False
+        # A music request ("播放……", "下一首") was handled: once its short
+        # answer is spoken, the conversation ends and the music comes back.
+        self.end_after_reply = False
+        self._background = set()
+
+    @staticmethod
+    def _resolve_future(future, result):
+        if not future.done():
+            future.set_result(result)
+
+    def _set_step(
+        self,
+        step: Step,
+        step_data=None,
+        new_session=False,
+        ignored_steps=(),
+    ):
+        with self.state_lock:
+            if self.current_step in ignored_steps:
+                return None
+            if new_session:
+                self.session_id += 1
+            session_id = self.session_id
+            self.current_step = step
+            future = self.next_step_future
+            future_loop = self.next_step_loop
+            self.next_step_future = None
+            self.next_step_loop = None
+
+        if future and future_loop and not future_loop.is_closed():
+            future_loop.call_soon_threadsafe(
+                self._resolve_future,
+                future,
+                (step, step_data),
+            )
+        return session_id
+
+    def update_step(self, step: Step, step_data=None):
+        if not get_env("CLI"):
+            return
+        self._set_step(step, step_data)
+
+    def _is_current_session(self, session_id):
+        with self.state_lock:
+            return session_id == self.session_id
+
+    async def wait_next_step(self, session_id, timeout=None):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        with self.state_lock:
+            if session_id != self.session_id:
+                future.cancel()
+                return ("interrupted", None)
+            previous_future = self.next_step_future
+            previous_loop = self.next_step_loop
+            self.next_step_future = future
+            self.next_step_loop = loop
+
+        if previous_future and previous_loop and not previous_loop.is_closed():
+            previous_loop.call_soon_threadsafe(
+                self._resolve_future,
+                previous_future,
+                ("interrupted", None),
+            )
+
+        try:
+            if timeout is None:
+                result = await future
+            else:
+                result = await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            result = ("timeout", None)
+        finally:
+            with self.state_lock:
+                if self.next_step_future is future:
+                    self.next_step_future = None
+                    self.next_step_loop = None
+            if not future.done():
+                future.cancel()
+
+        if not self._is_current_session(session_id):
+            # 当前 session 已经结束
+            return ("interrupted", None)
+        return result
+
+    def _begin_session(self, step, ignored_steps=()):
+        if not get_env("CLI"):
+            return
+        session_id = self._set_step(
+            step,
+            new_session=True,
+            ignored_steps=ignored_steps,
+        )
+        if session_id is None:
+            return
+        self.start_session(session_id, step)
+
+    def on_interrupt(self):
+        """用户打断（小爱同学）"""
+        self._begin_session(Step.on_interrupt)
+
+    def on_wakeup(self):
+        """用户唤醒（你好小智）"""
+        self._begin_session(Step.on_wakeup)
+
+    def barge_in(self, text, position=None):
+        """小七说话时用户喊了唤醒词：马上停下，接着听
+
+        position: 唤醒词大约在哪个输入采样点结束；之后已经说出的话会补给 VAD。
+        """
+        import traceback
+
+        try:
+            return self._barge_in(text, position)
+        except Exception:  # noqa: BLE001 - 打断失败必须能看见，不能静默
+            print(f"❌ 打断处理异常: {text}", flush=True)
+            traceback.print_exc()
+
+    def _barge_in(self, text, position=None):
+        print(f"→ 进入打断流程: {text}", flush=True)
+        # 这一步以前漏了：后面 _stop_prompt(speaker) 用到的 speaker 从没赋值，
+        # 于是一路抛 NameError，又被异步线程吞掉 —— 打断永远"没反应"。
+        speaker = get_speaker()
+        canceller = getattr(get_xiaoai(), "echo", None)
+        ratio = canceller.near_end_ratio_db() if canceller else None
+        min_db = get_barge_in_setting("near_end_min_db", None)
+        rejected = min_db is not None and ratio is not None and ratio < min_db
+        HEALTH.emit("barge_in", keyword=text, near_end_db=None if ratio is None else round(ratio, 1),
+                    rejected=rejected)
+        if rejected:
+            print(f"🙉 忽略疑似小七自己的声音: {text} ({ratio:.1f} dB)")
+            return
+        _stop_prompt(speaker)
+        _flash_wake()
+        tail = int(get_barge_in_setting("keyword_tail_ms", 100)) * 16
+        self.keyword_at = position
+        self.listen_from = None if position is None else max(0, position - tail)
+        print(f"✋ 打断小七: {text} (近端 {ratio:.1f} dB)" if ratio is not None
+              else f"✋ 打断小七: {text} (近端未知)")
+        self._begin_session(Step.on_barge_in)
+
+    def on_exit_words(self, text):
+        """用户说了退出词（拜拜、再见……）：不等超时，马上退出唤醒"""
+        print(f"👋 退出词: {text}")
+        self._begin_session(Step.on_exit_words, ignored_steps=(Step.idle,))
+
+    def on_tts_end(self, session_id):
+        """TTS结束"""
+        self._begin_session(
+            Step.on_tts_end,
+            ignored_steps=(Step.idle, Step.on_interrupt, Step.on_tts_end, Step.on_barge_in,
+                           Step.on_exit_words),
+        )
+
+    def on_tts_start(self, session_id):
+        """TTS结束"""
+        self.update_step(Step.on_tts_start)
+
+    def note_voice(self):
+        """有一帧被判为语音（哪怕没到一句话的长度）就记下时间，用于续期倒计时。"""
+        self._last_voice = time.monotonic()
+
+    def on_speech(self, speech_buffer: bytes):
+        """检测到声音（开始说话"""
+        self.update_step(Step.on_speech, speech_buffer)
+
+    def on_silence(self):
+        """检测到静音（说话结束）"""
+        self.update_step(Step.on_silence)
+
+    def _note_stt_ok(self):
+        """成功识别到一句话，清空"连续没听清"计数。"""
+        self._no_reply_streak = 0
+
+    def on_stt(self, exit_after_answer=False):
+        """服务端识别出了用户说的话
+
+        exit_after_answer: 话里带着告别（“关灯，拜拜”），回答完就退出唤醒，不再接着听。
+        """
+        with self.state_lock:
+            self.exit_after_answer = exit_after_answer
+        self.update_step(Step.on_stt)
+
+    def request_end_after_reply(self):
+        """The current request was for the music; end the conversation once it is answered."""
+        with self.state_lock:
+            self.end_after_reply = True
+
+    def session_active(self):
+        """A conversation with 小七 is going on (not idle, not handed to 小爱同学)."""
+        return self.current_step not in (Step.idle, Step.on_interrupt)
+
+    def _on_session_done(self, future):
+        with self.state_lock:
+            if self.session_future is future:
+                self.session_future = None
+        try:
+            future.result()
+        except concurrent.futures.CancelledError:
+            pass
+        except Exception as error:
+            print(f"❌ 对话状态机异常: {error}")
+
+    def start_session(self, session_id, trigger_step):
+        xiaozhi = get_xiaozhi()
+        loop = getattr(xiaozhi, "loop", None)
+        if not loop or loop.is_closed() or not loop.is_running():
+            print("❌ 对话状态机异常: 主事件循环不可用")
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.__start_session(session_id, trigger_step), loop
+        )
+        with self.state_lock:
+            previous_future = self.session_future
+            self.session_future = future
+        if previous_future and not previous_future.done():
+            previous_future.cancel()
+        future.add_done_callback(self._on_session_done)
+
+    async def __start_session(self, session_id, trigger_step):
+        if not get_env("CLI"):
+            return
+
+        if not self._is_current_session(session_id):
+            return
+        with self.state_lock:
+            exit_after_answer, self.exit_after_answer = self.exit_after_answer, False
+            # Only the answer to the music request itself ends the conversation;
+            # a new wake or barge-in starts over.
+            end_after_reply, self.end_after_reply = self.end_after_reply, False
+        exit_after_answer = exit_after_answer or (end_after_reply and trigger_step == Step.on_tts_end)
+
+        vad = get_vad()
+        codec = get_audio_codec()
+        speaker = get_speaker()
+        xiaozhi = get_xiaozhi()
+
+        # 先取消之前的 VAD 检测和音频输入输出流
+        xiaozhi.set_device_state(DeviceState.IDLE)
+        listen_from = keyword_at = None
+        if trigger_step == Step.on_barge_in:
+            listen_from, self.listen_from = self.listen_from, None
+            keyword_at, self.keyword_at = self.keyword_at, None
+            # Whatever the server still sends for the interrupted reply is dropped.
+            xiaozhi.ignore_tts_until_stt()
+        # TTS 正常结束时不要反向取消刚完成的任务。所有状态切换均在
+        # XiaoZhi.loop 上执行，避免跨事件循环等待 Task。
+        if trigger_step != Step.on_tts_end:
+            await xiaozhi.abort_tts_output()
+        if not self._is_current_session(session_id):
+            return
+        if trigger_step == Step.on_exit_words:
+            # Stop the server's answer to "拜拜" (it would not be played, see
+            # ignore_tts_until_stt) and say goodbye at once. After "退出" or
+            # "关闭" the server closes the connection itself.
+            try:
+                await xiaozhi.protocol.send_abort_speaking(AbortReason.ABORT)
+            except Exception as error:
+                print(f"⚠️ 退出时通知服务端失败: {error}")
+            await self._end_session(session_id, xiaozhi, speaker, reason="exit_words")
+            return
+        # 连续对话：回答完不退出，接着听一段（wakeup.timeout，现 5 秒）。
+        # 那段窗口里没人说话才静默退出；有人说话就接着聊，不用再喊一次唤醒词。
+        if trigger_step == Step.on_tts_end and getattr(xiaozhi, "_answer_pending", False):
+            xiaozhi._answer_pending = False
+
+        if trigger_step == Step.on_tts_end and exit_after_answer:
+            # The answer already said goodbye; no second goodbye.
+            print("👋 回答完了，退出唤醒")
+            await self._end_session(session_id, xiaozhi, speaker, reason="exit_after_answer",
+                                    goodbye=False)
+            return
+        await xiaozhi.protocol.send_abort_speaking(AbortReason.ABORT)
+
+        # 小爱同学唤醒时，直接打断
+        if trigger_step == Step.on_interrupt:
+            return
+
+        if trigger_step == Step.on_barge_in:
+            # A short tone instead of the wake greeting; listen at once. The
+            # tone's echo is cancelled like 小七's voice.
+            self._play_tone(speaker, get_barge_in_setting("prompt_tone", ""))
+
+        # 只留一小段时间避开音箱自己的余音，然后马上开始听。
+        # 以前要先等到 0.5s 安静才开始听，用户一接话就会被丢掉。
+        if trigger_step == Step.on_tts_end:
+            await asyncio.sleep(get_vad_setting("tts_end_guard_ms", 300) / 1000)
+            if not self._is_current_session(session_id):
+                return
+
+        # 检查是否有人说话
+        print(f"🎙️ 等待用户说话: session={session_id} trigger={trigger_step}")
+        # 等说话这段时间要亮灯（绿扫光），否则用户看不出她还在听。
+        try:
+            xiaozhi.listening_light()
+        except Exception as error:  # noqa: BLE001
+            print(f"⚠️ 倾听灯效失败: {error}", flush=True)
+        globals()["_REC_ON"] = True
+        _rec_start()
+        if listen_from is None:
+            vad.resume("speech")
+        else:
+            vad.resume("speech", since=listen_from)
+        # 倒计时可以在"有人出声"时续期：你说"嗯……"犹豫一下不会被打断
+        timeout_s = float(APP_CONFIG["wakeup"]["timeout"])
+        self._last_voice = time.monotonic()
+        deadline = time.monotonic() + timeout_s
+        speech_buffer = None
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                step, speech_buffer = "timeout", None
+                break
+            step, speech_buffer = await self.wait_next_step(
+                session_id, timeout=min(1.0, left)
+            )
+            if step != "timeout":
+                break
+            # 刚刚这段时间里有人出声 -> 续命，并把新的期限再往后推
+            if time.monotonic() - self._last_voice < 1.5:
+                deadline = time.monotonic() + timeout_s
+        if step == "timeout":
+            # 超时只是"没人说话了"：静默退出，不播告别语
+            await self._end_session(session_id, xiaozhi, speaker, goodbye=False)
+            return
+        if step != Step.on_speech:
+            return
+
+        # 开始说话
+        speech_end = getattr(vad, "read_position", None)
+        if listen_from is not None and keyword_at is not None and speech_end is not None:
+            speech_buffer = self._with_lookback(speech_buffer, speech_end, listen_from, keyword_at)
+        # 送识别前把"VAD 缓冲之前"那一段也补上：现在的拼接是「VAD 缓冲 + 实时流」，
+        # 两段之间会有缝，开口前 0.3~0.8 秒会被吃掉（"现在几点了"变成"听点"）。
+        # GlobalStream 保留最近 3 秒音频，直接按采样位置回捞，保证连续。
+        try:
+            prepend_ms = int(get_vad_setting("prepend_lookback_ms", 600))
+            end_pos = getattr(vad, "read_position", None)
+            if end_pos is not None and speech_buffer:
+                buf_start = end_pos - len(speech_buffer) // 2
+                if buf_start > 0:
+                    extra = GlobalStream.recent(max(0, buf_start - prepend_ms * 16), buf_start)
+                    if extra:
+                        speech_buffer = extra + bytes(speech_buffer)
+        except Exception as error:  # noqa: BLE001
+            print(f"⚠️ 补头部音频失败: {error}", flush=True)
+        set_speech_frames(speech_buffer)
+        if speech_end is None:
+            codec.input_stream.start_stream()  # 开启录音
+        else:
+            # After a barge-in the VAD is still catching up with the replayed
+            # audio when it hears speech; continuing from "now" lost 0.2-0.35 s
+            # ("宁波市中心" became "播中心"). Continue where it stopped reading.
+            codec.input_stream.start_stream(since=speech_end)
+        _stop_prompt(speaker)
+        await xiaozhi.protocol.send_start_listening(ListeningMode.MANUAL)
+        xiaozhi.set_device_state(DeviceState.LISTENING)
+
+        # 等待说话结束
+        vad.resume("silence")
+        step, _ = await self.wait_next_step(session_id)
+        if step != Step.on_silence:
+            return
+
+        # 停止说话
+        _dump_utterance(_rec_stop())
+        await xiaozhi.protocol.send_stop_listening()
+        xiaozhi.set_device_state(DeviceState.IDLE)
+
+        # 服务端没识别出内容时不会回复，也就不会再触发 TTS 结束。
+        # 不要一直干等：提示用户重说，然后重新开始听。
+        step, _ = await self.wait_next_step(
+            session_id, timeout=get_vad_setting("no_reply_timeout", 5)
+        )
+        if step != "timeout":
+            return
+        # 没识别出内容：默认不出声，直接重新听；连错两次就安静退出，免得空转
+        streak = getattr(self, "_no_reply_streak", 0) + 1
+        self._no_reply_streak = streak
+        prompt = get_vad_setting("no_reply_prompt", "")
+        if prompt:
+            await speaker.play(text=prompt)
+        if not self._is_current_session(session_id):
+            return
+        if streak >= 2:
+            print("🤷 连续两次没听清，安静退出")
+            self._no_reply_streak = 0
+            await self._end_session(session_id, xiaozhi, speaker, goodbye=False)
+            return
+        print("🤷 没有识别到内容，静默重听")
+        self._begin_session(Step.on_tts_end)
+
+    @staticmethod
+    def _with_lookback(speech, speech_end, listen_from, keyword_at):
+        """Said in one breath ("你好小七宁波市中心在哪里"), the request starts
+        as the keyword ends, but the keyword is recognized up to ~0.4 s later.
+        The VAD starts just before the hit so the end of "七" cannot pass for
+        speech; the recognizer gets audio from further back. SenseVoice ignored
+        that leading tail in every recorded case. Only when the VAD buffer
+        reaches back to where listening began: otherwise it already holds the
+        pause before the request and nothing was cut."""
+        start = speech_end - len(speech) // 2
+        if start > listen_from:
+            return speech
+        lookback = int(get_barge_in_setting("speech_lookback_ms", 350)) * 16
+        return GlobalStream.recent(keyword_at - lookback, start) + bytes(speech)
+
+    def _play_tone(self, speaker, path):
+        if not path:
+            return
+        task = asyncio.ensure_future(
+            speaker.run_shell(f"miplayer -f {shlex.quote(path)} >/dev/null 2>&1", timeout=3000)
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _end_session(self, session_id, xiaozhi, speaker, reason="no_speech_timeout",
+                           goodbye=True):
+        with self.state_lock:
+            if session_id != self.session_id:
+                return
+            self.current_step = Step.idle
+        kws = get_kws()
+        kws.pause()
+        HEALTH.emit("session_exit_start", session_id=session_id, reason=reason)
+        try:
+            # IDLE stops VAD and the conversation streams. KWS has its own
+            # stream, so keep it paused through the goodbye and its echo.
+            xiaozhi.set_device_state(DeviceState.IDLE)
+            print("👋 已退出唤醒")
+            after_wakeup = APP_CONFIG["wakeup"].get("after_wakeup") if goodbye else None
+            if callable(after_wakeup):
+                HEALTH.emit("session_exit_prompt_start", session_id=session_id)
+                try:
+                    await after_wakeup(speaker)
+                except Exception as error:
+                    HEALTH.emit("session_exit_prompt_error", session_id=session_id, error=type(error).__name__)
+                    print(f"❌ 退出提示播放失败: {error}")
+                else:
+                    HEALTH.emit("session_exit_prompt_end", session_id=session_id)
+                guard_ms = max(0, APP_CONFIG["wakeup"].get("exit_guard_ms", 300))
+                await asyncio.sleep(guard_ms / 1000)
+                HEALTH.emit("session_exit_guard_end", session_id=session_id, guard_ms=guard_ms)
+        except asyncio.CancelledError:
+            HEALTH.emit("session_exit_cancelled", session_id=session_id)
+            raise
+        finally:
+            # resume only requests a reset; the inference thread owns the model.
+            # Nested pauses keep an interrupted exit from unpausing a new wake.
+            kws.resume(reason="session_exit")
+            HEALTH.emit("session_exit_end", session_id=session_id, kws_paused=kws.paused)
+            self._in_background(self._music("on_session_end"))
+
+    def _in_background(self, coro):
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    @staticmethod
+    async def _music(event):
+        """Tell the music player (if any) that 小七 woke up or went back to sleep."""
+        music = get_music()
+        if not music:
+            return
+        try:
+            await getattr(music, event)()
+        except Exception as error:
+            print(f"⚠️ 调整音乐音量失败: {error}")
+
+    async def wakeup(self, text, source):
+        if source == "kws":
+            # Music down before the wake prompt; it comes back when the
+            # conversation ends. Never hold up the wake for it.
+            try:
+                await asyncio.wait_for(asyncio.shield(self._music("on_wake")), 1.5)
+            except asyncio.TimeoutError:
+                pass
+        _flash_wake()
+        # 唤醒提示语的收音保护已经由 config.before_wakeup 里的 mute_for_prompt
+        # 接管（那段时间直接不收音）。这里只把 echo_until 推到提示语结束，
+        # 让"回采还在播"的判定和实际提示语长度一致。原来写死 2.8 秒，
+        # 提示语改成 0.5 秒的"我在"之后会把静音窗口白白拖长。
+        try:
+            from xiaozhi.services.audio.stream import GlobalStream as _GS
+
+            from config import prompt_seconds
+
+            guard_s = float(
+                APP_CONFIG["wakeup"].get("prompt_echo_guard_s", 0) or prompt_seconds() + 0.8
+            )
+            get_xiaoai().echo_until = _GS.samples + int(guard_s * 16000)
+        except Exception as error:  # noqa: BLE001
+            print(f"⚠️ 提示语回声保护设置失败: {error}", flush=True)
+
+        before_wakeup = APP_CONFIG["wakeup"]["before_wakeup"]
+        get_kws().pause()  # 暂停 KWS 检测
+        try:
+            wakeup = await before_wakeup(get_speaker(), text, source)
+        except Exception as error:
+            wakeup = False
+            print(f"❌ 唤醒处理失败: {error}")
+        finally:
+            get_kws().resume()  # 恢复 KWS 检测
+        if wakeup:
+            self.on_wakeup()
+
+
+EventManager = __EventManager()
+
+
+# ---------------------------------------------------------------- 调试落盘
+def _dump_utterance(pcm: bytes) -> None:
+    """把这一轮真正送去识别的 16k 单声道 PCM 存成 wav，用于离线比对 ASR。"""
+    import os
+    import time
+    import wave
+
+    if os.environ.get("DUMP_UTTERANCE", "0") != "1":
+        return
+    try:
+        out_dir = os.environ.get("UTTERANCE_DIR", "/data/logs/utterances")
+        os.makedirs(out_dir, exist_ok=True)
+        name = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}.wav"
+        path = os.path.join(out_dir, name)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+        with open(os.environ.get("DIALOG_LOG", "/data/logs/dialog.jsonl"), "a", encoding="utf-8") as f:
+            import json as _json
+
+            f.write(_json.dumps({"ts": time.time(), "role": "audio", "file": name,
+                                 "ms": round(len(pcm) / 2 / 16000 * 1000)}, ensure_ascii=False) + "\n")
+        # 声纹：只记录 embedding，不做任何判断（阶段 0）。丢到后台线程算，
+        # 单条约 110 ms，不挡音频链路；出错也只是少一条记录。
+        try:
+            from xiaozhi.speaker_id import record as _record_speaker
+
+            _record_speaker(name, pcm)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 落盘失败: {exc}", flush=True)
+
+
+def _flash_wake() -> None:
+    """唤醒瞬间：灯环白一下（失败也不能挡住唤醒）。"""
+    try:
+        import asyncio as _aio
+
+        speaker = get_speaker()
+        loop = getattr(get_xiaozhi(), "loop", None)
+        if speaker is None or loop is None:
+            return
+        _aio.run_coroutine_threadsafe(
+            speaker.run_shell("sh /data/open-xiaoai/led.sh wake", timeout=2000), loop
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f"⚠️ 唤醒灯效失败: {error}", flush=True)
+
+def _stop_prompt(speaker) -> None:
+    """停掉设备本地还在播的唤醒提示语（不阻塞调用方）。"""
+    try:
+        import asyncio as _aio
+
+        _aio.ensure_future(
+            speaker.run_shell("sh /data/open-xiaoai/stop_tts.sh", timeout=2000)
+        )
+    except Exception:  # noqa: BLE001
+        pass

@@ -1,0 +1,15 @@
+# 运行时产物，不入库
+logs/
+**/__pycache__/
+*.pyc
+
+# 真实配置（含 API Key），模板见 xiaozhi/data/.config.example.yaml
+xiaozhi/data/.config.yaml
+xiaozhi/data/*.json
+
+# 大模型文件（除已入库的 keywords.txt / tokens.txt / campplus.onnx）
+xiaozhi/models/
+bridge/models/encoder.onnx
+bridge/models/decoder.onnx
+bridge/models/joiner.onnx
+bridge/models/silero_vad.onnx

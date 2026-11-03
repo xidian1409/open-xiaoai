@@ -1,0 +1,127 @@
+name: xiaoqi
+
+services:
+  # 小智服务端：ASR / VAD / LLM / TTS / 会话
+  xiaozhi-server:
+    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest
+    container_name: xiaozhi-server
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "8000:8000"   # websocket（桥接拨入）
+      - "8003:8003"   # OTA / http
+    volumes:
+      - ./xiaozhi/data:/opt/xiaozhi-esp32-server/data
+      - ./xiaozhi/models:/opt/xiaozhi-esp32-server/models
+      # 用 wttr.in 版天气插件替换镜像里的和风实现（新版 key 需要专属 Host）
+      - ./xiaozhi/plugins/get_weather.py:/opt/xiaozhi-esp32-server/plugins_func/functions/get_weather.py:ro
+
+  # 桥接：小爱音箱(4399) ↔ 小智(xiaozhi-server)
+  bridge:
+    image: local/open-xiaoai-xiaozhi:barge-in
+    container_name: xiaoai-bridge
+    restart: unless-stopped
+    depends_on:
+      - xiaozhi-server
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - DUMP_UTTERANCE=1
+      - DIALOG_LOG=/data/logs/dialog.jsonl
+      - UTTERANCE_DIR=/data/logs/utterances
+      # LX06 上没有 mibrain，用不了 native_xiaomi；走服务端 TTS（EdgeTTS）音频流
+      - XIAOZHI_TTS_OUTPUT_MODE=sherpa
+    ports:
+      - "4399:4399"   # 音箱拨入
+      - "4400:4400"   # 本地音乐（先不开，占位）
+    volumes:
+      - ./bridge/config.py:/app/config.py:ro
+      - ./bridge/prompt.pcm:/app/prompt.pcm:ro
+      - ./bridge/farewell.pcm:/app/farewell.pcm:ro
+      - ./bridge/xiaoai.py:/app/xiaozhi/xiaoai.py:ro
+      - ./bridge/config_util.py:/app/xiaozhi/utils/config.py:ro
+      # 对话记录 + 每轮语音落盘（event.py 负责 wav，xiaozhi.py 负责文本）
+      - ./bridge/event.py:/app/xiaozhi/event.py:ro
+      - ./bridge/stream.py:/app/xiaozhi/services/audio/stream.py:ro
+      # 人声续期：任何一帧语音都刷新倒计时
+      - ./bridge/vad_hook.py:/app/xiaozhi/services/audio/vad/__init__.py:ro
+      - ./bridge/xiaozhi_main.py:/app/xiaozhi/xiaozhi.py:ro
+      # 唤醒词打分/阈值改成读 config（镜像里写死 keywords_score=2.0，唤不醒）
+      - ./bridge/kws_sherpa.py:/app/xiaozhi/services/audio/kws/sherpa.py:ro
+      - ./logs:/data/logs
+      # 唤醒词模型（sherpa-onnx KWS，来自 open-xiaoai_kws 发布包）
+      - ./bridge/models/encoder.onnx:/app/xiaozhi/models/encoder.onnx:ro
+      - ./bridge/models/decoder.onnx:/app/xiaozhi/models/decoder.onnx:ro
+      - ./bridge/models/joiner.onnx:/app/xiaozhi/models/joiner.onnx:ro
+      - ./bridge/models/tokens.txt:/app/xiaozhi/models/tokens.txt:ro
+      - ./bridge/models/keywords.txt:/app/xiaozhi/models/keywords.txt:ro
+      - ./bridge/models/silero_vad.onnx:/app/xiaozhi/models/silero_vad.onnx:ro
+      # 声纹 embedding 模型（CAM++，只记录不做判断）
+      - ./bridge/models/campplus.onnx:/app/xiaozhi/models/campplus.onnx:ro
+      - ./bridge/speaker_id.py:/app/xiaozhi/speaker_id.py:ro
+      # KWS 命中时的判定日志（打断排查）
+      - ./bridge/kws_init.py:/app/xiaozhi/services/audio/kws/__init__.py:ro
+      - ./logs/speakers:/data/speakers
+      - ./bridge/speaker_report.py:/app/speaker_report.py:ro
+    # 唤醒词文件用 gen_keywords.py 预生成，跳过镜像里需要 bpe.model 的生成步骤
+    command: ["/bin/bash", "-c", "source /app/.venv/bin/activate && exec python main.py"]
+
+  # 声纹识别服务：给小智服务端的 voiceprint 接口用（CAM++ + 管理页登记的设备录音）
+  voiceprint:
+    image: local/open-xiaoai-xiaozhi:barge-in
+    container_name: xiaoqi-voiceprint
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=8096
+      - VOICEPRINT_KEY=xiaoqi
+      - SPEAKER_DIR=/data/speakers
+    command: ["/bin/bash", "-c", "cd /app && exec /app/.venv/bin/python /app/voiceprint_svc.py"]
+    ports:
+      - "8096:8096"
+    volumes:
+      - ./bridge/voiceprint_svc.py:/app/voiceprint_svc.py:ro
+      - ./bridge/models/campplus.onnx:/app/xiaozhi/models/campplus.onnx:ro
+      - ./logs/speakers:/data/speakers
+
+  # 声纹管理页：登记人员、录测试音频、试匹配（不影响对话链路）
+  speaker-web:
+    image: local/open-xiaoai-xiaozhi:barge-in
+    container_name: xiaoqi-speaker
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=8097
+      - TLS_PORT=8444
+      - SPEAKER_DIR=/data/speakers
+    command: ["/bin/bash", "-c", "cd /data && exec /app/.venv/bin/python /data/speaker_web.py"]
+    ports:
+      - "8097:8097"
+      - "8444:8444"
+    volumes:
+      - ./bridge/speaker_web.py:/data/speaker_web.py:ro
+      - ./bridge/speaker_lib.py:/data/speaker_lib.py:ro
+      - ./bridge/models/campplus.onnx:/app/xiaozhi/models/campplus.onnx:ro
+      - ./logs/speakers:/data/speakers
+
+  # 对话记录页（只读）
+  dialog-web:
+    image: local/open-xiaoai-xiaozhi:barge-in
+    container_name: xiaoqi-dialog
+    restart: unless-stopped
+    depends_on:
+      - bridge
+    environment:
+      - TZ=Asia/Shanghai
+      - DIALOG_LOG=/data/logs/dialog.jsonl
+      - UTTERANCE_DIR=/data/logs/utterances
+      - PORT=8098
+    command: ["/app/.venv/bin/python", "/data/dialog_web.py"]
+    ports:
+      - "8098:8098"
+    volumes:
+      - ./logs:/data/logs
+      - ./bridge/dialog_web.py:/data/dialog_web.py:ro
