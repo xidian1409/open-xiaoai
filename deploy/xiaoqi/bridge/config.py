@@ -224,12 +224,13 @@ APP_CONFIG = {
         # Docker 部署可通过 XIAOZHI_TTS_OUTPUT_MODE 环境变量覆盖。
         "mode": "native_xiaomi",
         "native_xiaomi": {
-            # 第一段立即播放；后续文本按目标长度或短暂等待进行合并。
-            "target_chars": 80,
-            "max_chars": 120,
-            "flush_delay_ms": 250,
-            # 已合成但尚未播放的最大段数。
-            "prefetch_segments": 2,
+            # 播放改走 PCM 通道后不再需要"合并成一段省去重起播放器"，
+            # 反而要切小一点：句子越短合成越快，预取才跟得上，不会中途断流。
+            "target_chars": 12,
+            "max_chars": 60,
+            "flush_delay_ms": 80,
+            # 已合成但尚未播放的最大段数（句子切小后可以多预取几段，抵抗设备卡顿）。
+            "prefetch_segments": 4,
             "generate_timeout_ms": 5000,
             "play_timeout_ms": 10 * 60 * 1000,
             # miplayer 偶发不退出时，按音频时长动态终止播放。
@@ -240,7 +241,7 @@ APP_CONFIG = {
         },
     },
     "xiaozhi": {
-        # ⚠️ 换成你自己 NAS 的地址（这里只是占位示例）
+        # ⚠️ 占位示例，换成你自己 NAS 的地址
         "OTA_URL": "http://192.168.1.100:8003/xiaozhi/ota/",
         "WEBSOCKET_URL": "ws://192.168.1.100:8000/xiaozhi/v1/",
         "WEBSOCKET_ACCESS_TOKEN": "", #（可选）一般用不到这个值

@@ -15,6 +15,14 @@ from xiaozhi.services.native_tts import (
     NativeXiaomiTTS,
     resolve_tts_output_mode,
 )
+
+# 原生音色的播放改走 PCM 通道（解码 + 重采样 + 推流），不再每段起一次 miplayer。
+# 缺依赖时退回上游实现，至少不会因为一个 import 挂掉整条链路。
+try:
+    from xiaozhi.services.native_tts_pcm import NativeXiaomiTTSPCM as _NativeTTSImpl
+except Exception as _native_pcm_error:  # noqa: BLE001
+    print(f"⚠️ 原生 TTS 的 PCM 播放不可用，退回 miplayer：{_native_pcm_error}")
+    _NativeTTSImpl = NativeXiaomiTTS
 from xiaozhi.services.protocols.typing import (
     AbortReason,
     DeviceState,
@@ -54,7 +62,7 @@ class XiaoZhi:
             get_env("XIAOZHI_TTS_OUTPUT_MODE"),
         )
         native_config = tts_output_config.get("native_xiaomi", {})
-        self.native_tts = NativeXiaomiTTS(
+        self.native_tts = _NativeTTSImpl(
             XiaoAI.speaker,
             NativeTTSSettings.from_config(native_config),
         )

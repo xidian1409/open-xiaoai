@@ -1,6 +1,6 @@
 # 小七 · 小爱音箱 Pro（LX06）语音助手
 
-把小米 AI 音箱 Pro（LX06）改造成一个**全本地唤醒、云端只听 LLM 和 TTS** 的家庭语音助手：
+把小米 AI 音箱 Pro（LX06）改造成一个**唤醒/ASR/声纹全本地、只有大模型联网**的家庭语音助手：
 叫「你好小七」就能对话，有灯环反馈、能被打断、能认出是谁在说话。
 
 > 这是 [open-xiaoai](https://github.com/OwnDing/open-xiaoai) 的**定制层（overlay）**，不是上游代码的拷贝。
@@ -49,8 +49,8 @@ deploy/xiaoqi/
 
 | 服务 | 端口 | 作用 |
 |---|---|---|
-| `xiaozhi-server` | 8000 / 8003 | ASR、LLM、TTS、会话管理（上游镜像） |
-| `bridge` | 4399 / 4400 | 音箱拨进来的 WebSocket + 音频链路 |
+| `xiaozhi-server` | 8000 / 8003 | ASR、LLM、会话管理（TTS 已换成「只发文字」） |
+| `bridge` | 4399 / 4398 / 4400 | 音箱拨进来的 WebSocket + 音频链路 + 原生 TTS 调度 |
 | `voiceprint` | 8096 | 声纹识别 HTTP 服务（CAM++） |
 | `speaker-web` | 8097 / 8444 | 声纹管理页（8444 是 HTTPS，**网页录音必须走它**） |
 | `dialog-web` | 8098 | 对话记录页（只读） |
@@ -64,6 +64,20 @@ build context 必须是**仓库根目录**（`Dockerfile.bridge` 里要 `COPY ex
 ```bash
 docker build -f deploy/xiaoqi/Dockerfile.bridge -t local/open-xiaoai-xiaozhi:local .
 ```
+
+### 4.1.1 补两个 Python 小依赖
+
+镜像里没有 `pip`，而原生 TTS 链路要用 `soundfile`（解 mibrain 的 mp3）和 `soxr`
+（16k→24k 重采样）。装到一个挂载目录里即可，不用重建镜像：
+
+```bash
+docker run --rm -v "$PWD/deploy/xiaoqi/bridge/pylibs:/out" \
+  --entrypoint /usr/local/bin/pip local/open-xiaoai-xiaozhi:pcm-buf \
+  install --no-cache-dir --no-deps --target /out \
+  soundfile soxr cffi typing_extensions pycparser
+```
+
+（`pylibs/` 是二进制产物，没有入库，`.gitignore` 里排除了。）
 
 > 镜像里 `CMD` 会先跑 `keywords.py` 生成唤醒词，这一步需要 `bpe.model`。
 > 本定制层用 `gen_keywords.py` **预生成** `keywords.txt` 并挂载进去，同时在 `compose.yaml`
@@ -166,12 +180,16 @@ docker compose exec bridge python /app/xiaozhi/kws_verify.py
 docker compose exec bridge python /app/speaker_report.py
 ```
 
-`prompt.pcm` / `farewell.pcm` 是 EdgeTTS 生成的，想换词重生成时注意
-必须和服务端 TTS 用**同一套参数（24 kHz、同样的 voice）**，否则音色不一致会很出戏：
+`prompt.pcm` / `farewell.pcm` 用**设备自己的 mibrain** 生成，和对话是同一个音色，
+不会再出现"提示语一个声音、回答另一个声音"。必须转成 24 kHz 单声道 s16le
+（设备播放通道是 24k，用 16k 会变速变调）：
 
 ```bash
-edge-tts --voice zh-CN-XiaoxiaoNeural --text "我在" --write-media tmp.mp3
-ffmpeg -i tmp.mp3 -f s16le -acodec pcm_s16le -ac 1 -ar 24000 bridge/prompt.pcm
+# 1. 在音箱上合成（LX06 的 mibrain，0.1~0.3 秒）
+ssh root@<音箱IP> 'ubus call mibrain text_to_speech "{\"text\":\"我在\",\"save\":1}"'
+# 2. 把返回的 /tmp/tts/xxx.mp3 取回 NAS（ssh cat 即可，走 pty 会损坏二进制）
+# 3. 转成 24k 单声道裸 PCM
+ffmpeg -y -i prompt.mp3 -f s16le -acodec pcm_s16le -ac 1 -ar 24000 bridge/prompt.pcm
 ```
 
 ## 7. 已知限制
@@ -180,7 +198,8 @@ ffmpeg -i tmp.mp3 -f s16le -acodec pcm_s16le -ac 1 -ar 24000 bridge/prompt.pcm
   实测远场 SNR 4.8 dB，做多路平均也没有收益，反而把设备内存打爆过。详见 DESIGN.md 2.3 / 6.7。
 - 声纹**必须用音箱自己录的片段**登记。手机上传的音频域差太大，相似度中位数只有 0.237，
   和「不认识的人」完全区分不开。
-- `abort_tts_output()` 在 TTS 直出模式下是空操作，打断后还会漏 0.3–0.5 秒尾音。
+- 原生音色模式下打断走 `mediaplayer player_play_operation stop`，比 PCM 流更干脆；
+  首句优先（`XIAOQI_FIRST_SENTENCE_PLAY=1`）会让段之间留约 0.3 秒衔接缝，关掉可回到无缝的整段播放。
 - 音箱只有 118 MB 可用内存、5–8 MB 空闲，**不要在设备上加实时多路 DSP**。
 
 ## 8. 许可

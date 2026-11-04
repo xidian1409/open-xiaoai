@@ -3,7 +3,6 @@ voiceprint:
   url: http://xiaoqi-voiceprint:8096/voiceprint/identify?key=xiaoqi
   similarity_threshold: 0.45
   speakers:
-    # 格式：人员id,称呼,和你的关系；id 在声纹管理页添加人员后生成
     - "p_xxxxxxxx,示例称呼,家里的男主人"
 
 # xiaozhi-esp32-server 覆盖配置（只写需要覆盖的项，其余用镜像自带 config.yaml）
@@ -11,7 +10,6 @@ server:
   ip: 0.0.0.0
   port: 8000
   http_port: 8003
-  # ⚠️ 占位示例，换成你自己 NAS 的地址
   websocket: ws://192.168.1.100:8000/xiaozhi/v1/
 
 # 只保留真正可用、且不会卡住的工具（web_search 没有 Tavily key、get_weather 的
@@ -20,10 +18,10 @@ Intent:
   function_call:
     type: function_call
     functions:
-      - change_role
-      - get_news_from_newsnow
-      - play_music
+      # 只留真正用得上的工具：工具定义越长，大模型首字越慢，
+      # 而且 play_music 会去播镜像里自带的 3 首 demo，说了"放首歌"反而莫名其妙。
       - get_weather
+      - get_news_from_newsnow
 
 plugins:
   get_weather:
@@ -34,7 +32,7 @@ selected_module:
   VAD: SileroVAD
   ASR: SherpaASR
   LLM: DeepSeekLLM
-  TTS: EdgeTTS
+  TTS: TextOnly   # 只发文字；合成交给音箱本地 mibrain
   Memory: nomem
   Intent: function_call
 
@@ -52,7 +50,6 @@ LLM:
     type: openai
     model_name: deepseek-chat
     url: https://api.deepseek.com
-    # ⚠️ 换成你自己的 DeepSeek Key（或用环境变量注入）
     api_key: "sk-请替换为你的DeepSeekKey"
 
 prompt: |
@@ -74,3 +71,10 @@ VLLM:
     model_name: ""
     url: ""
     api_key: ""
+
+TTS:
+  # 不合成音频，只把 sentence_start(文本) 立刻下发；桥接用音箱本地 TTS 播。
+  # 备份的 EdgeTTS 配置见 TTS.EdgeTTS（镜像自带），切回去只需改 selected_module.TTS。
+  TextOnly:
+    type: textonly
+    output_dir: tmp/

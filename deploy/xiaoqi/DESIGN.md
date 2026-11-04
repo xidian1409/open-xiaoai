@@ -1,27 +1,17 @@
 # 小七家庭语音助手 · 设计文档
 
-> 最后一次大改：2026-11-03。本文档记录**当前实现状态**、**为什么这么做**、**踩过的坑**，
+> 最后一次大改：2026-11-04（音频输出链路重做：原生音色 + 并行合成 + 整段播放）
+> 本文档记录**当前实现状态**、**为什么这么做**、**踩过的坑**和**实测数字**，
 > 方便后续迭代时不用重新踩一遍。
 >
-> 机器：小米 AI 音箱 Pro（LX06）· <音箱IP> · NAS `<NAS_IP>`
+> 机器：小米 AI 音箱 Pro（LX06）· NAS 上跑 5 个容器
 
 ---
 
 ## 1. 一句话概览
 
-用 `OwnDing/open-xiaoai` 的 fork 把音箱改造成自建语音助手：
-**唤醒/VAD 跑在音箱边的桥接上，ASR/LLM/TTS 跑在 NAS 上**，全链路数据不出家门（除了 LLM 和 TTS 的网络请求）。
-
-和原版小爱的关键差异：
-
-| | 原版小爱 | 现在这套 |
-|---|---|---|
-| 唤醒词 | 小爱同学 | **你好小七**（备用：小七小七） |
-| ASR | 小米云 | 本地 SenseVoice |
-| LLM | 小爱云 | DeepSeek |
-| TTS | 小米云（有内容审查） | EdgeTTS（无审查） |
-| 声纹 | 小米云 | 本地 CAM++ |
-| 唤醒音频 | 上传小米云（100%） | 不出家门 |
+把 LX06 改成一个**唤醒、VAD、ASR、声纹全部本地**的家庭语音助手：叫「你好小七」就能对话，
+有灯环反馈、能被打断、能认出是谁在说话、说话用的是小爱原生音色。只有大模型在联网。
 
 ---
 
@@ -31,11 +21,13 @@
 
 | 容器 | 镜像 | 端口 | 作用 |
 |---|---|---|---|
-| `xiaoai-bridge` | `local/open-xiaoai-xiaozhi:barge-in` | 4399 | 接音箱、唤醒、VAD、AEC、音频转发 |
-| `xiaozhi-server` | `xinnan-tech/xiaozhi-esp32-server:server_latest` | 8000(ws) / 8003(OTA) | ASR、LLM、TTS、会话状态机 |
+| `xiaoai-bridge` | `local/open-xiaoai-xiaozhi:pcm-buf` | 4399 / 4398 | 接音箱、唤醒、VAD、AEC、音频转发、原生 TTS 合成调度 |
+| `xiaozhi-server` | `xinnan-tech/xiaozhi-esp32-server:server_latest` | 8000(ws) / 8003(OTA) | ASR、LLM、会话状态机（TTS 已换成"只发文字"） |
 | `xiaoqi-dialog` | 同 bridge | 8098 | 对话记录页（只读） |
 | `xiaoqi-speaker` | 同 bridge | 8097 / 8444(https) | 声纹管理页 |
 | `xiaoqi-voiceprint` | 同 bridge | 8096 | 声纹识别 HTTP 服务（给小智服务端用） |
+
+> `pcm-buf` 这个 tag 是因为设备侧 aplay 缓冲从 200 ms 加深到了 600 ms（见 3.9）。
 
 ### 2.2 数据流
 
@@ -47,35 +39,83 @@ LX06 6 麦 + 2 路回采（8ch / 48k / S32）
    │
    ├─► KWS（sherpa-onnx zipformer，关键词「你好小七」）
    ├─► VAD（Silero v5）
-   └─► 整句 PCM ──┬─► 送 xiaozhi-server（ASR → LLM → TTS）
+   └─► 整句 PCM ──┬─► 送 xiaozhi-server（ASR → LLM）
                   └─► 本机算声纹 embedding（192 维，~110 ms）
                         ├─► 写 speakers.jsonl（观察用）
                         └─► 写 dialog.jsonl 的 speaker 记录（页面标签）
 
-xiaozhi-server 收到整句音频后：
+xiaozhi-server：
    ├─► SenseVoice 识别出文字
-   ├─► 调 http://xiaoqi-voiceprint:8096/voiceprint/identify 认人
-   │      → 把「当前说话人：X」注入系统提示词 <speakers_info>
-   └─► DeepSeek 生成回答 → EdgeTTS 合成 24k PCM → 桥接 → 音箱
+   ├─► 调 http://xiaoqi-voiceprint:8096/voiceprint/identify 认人 → 注入 <speakers_info>
+   └─► DeepSeek 生成回答 → **只下发文字**（TextOnly TTS provider，不合成音频）
+          │
+          ▼
+桥接原生 TTS 链路（见 2.4）：mibrain 并行合成 → 拼接 → 常驻播放器播放
 ```
 
 ### 2.3 为什么音频链路是"一路麦克风"
 
-设备暴露的是 8 声道 PDM 原始数据（`hw:0,3`），**没有 DSP 波束成形的输出**。
-选 ch0 而不是 6 路求和的原因（实测）：
+设备能采 8 声道（6 麦 + 2 路重复回采），但我们只取 ch0（主麦）和 ch6（回采参考）：
 
-| 方案 | SNR |
-|---|---|
-| 单路 ch0 | 4.8 dB |
-| 6 路直接平均 | 4.7 dB |
-| 6 路延迟对齐相加 | 4.7 dB |
+- 实测 6 路麦平均**没有 SNR 收益**（噪声相关性 0.40），远场语音 SNR 只有 4.8 dB
+- 做多路实时处理会把 118 MB 内存的设备压垮（曾 OOM 杀掉小爱引擎 29 次）
 
-因为噪声本身在 6 路之间是**相关**的（静音段互相关 0.40），多路平均只能消独立噪声，
-理论上限 `6/(1+5×0.4)=3 dB`，实测还被相位误差吃掉一部分。**不值得为此重编译客户端。**
+### 2.4 语音链路全流程（当前实现）
 
-> 小爱的前端确实更强（DOA 波束成形 + 更好的 AEC，唤醒时自报 SNR 14.9 dB），
-> 但那是联发科闭源 SDK 跑在同一颗 SoC 上，搬不过来；
-> 而且设备已经满载（118 MB 内存，常态只剩 5~8 MB，load 6~10）。
+这是整条链路，从用户开口到声音出来：
+
+```
+① 用户说话
+② 设备采集 8ch/48k → 只取 ch0+ch6 → 16k 立体声 → 桥接
+③ 桥接 AEC 消回声 → KWS 监听 / VAD 判停
+④ 说完一句 → 整句 PCM 送 xiaozhi-server
+⑤ 服务端 SenseVoice 识别（本地）→ 声纹认人（本地 HTTP）→ DeepSeek 生成
+⑥ 服务端按标点切句，每句发一条 sentence_start(文字) —— TextOnly provider 不做合成
+⑦ 桥接收到一句文字 → 立刻起一个 mibrain 合成任务（设备本地，并发上限 4）
+⑧ 第一句合成完 → 桥接让它"整段播"：常驻 mediaplayer 播 file:// 本地文件
+⑨ 后续句子在播放期间并行合成，凑齐后拼接成第二个文件接续播放
+⑩ 播完 → 回到聆听状态（连续对话 5 秒）
+```
+
+**关键设计**：播放动作完全在设备侧（守护进程读本地文件），桥接只负责"合成 + 调度"，
+所以 NAS 忙、Wi-Fi 抖动、RPC 卡顿都不会让声音断续。
+
+### 2.5 各阶段耗时（实测）
+
+环境：LX06（4 核 / 118 MB 可用 / 播音频时 load 6+）+ NAS（Ubuntu 系，x86_64）
+
+| 阶段 | 实测耗时 | 说明 |
+|---|---|---|
+| 唤醒词检测 | < 100 ms | 桥接侧 KWS，流式 |
+| 提示语「我在」 | 0.54 s 音频 | 本地 mibrain 生成，走 PCM 通道 |
+| VAD 判停 | 0.3~0.6 s | Silero v5，可调 |
+| ASR（SenseVoice，本地） | 0.2~0.4 s | 整句识别 |
+| 声纹识别 | 0.09~0.15 s | 并行执行，不占主链路 |
+| **大模型首字（TTFT）** | **0.83~1.14 s** | DeepSeek，最大的一块 |
+| 大模型出完整回答 | +0.3~1.5 s | 取决于句子数，逐句流式 |
+| 单句合成（mibrain） | 0.08~0.65 s | 设备本地；设备忙时可到 1.2 s |
+| 拼接（cat + wc） | 15~42 ms | 一次 RPC |
+| 起播（常驻 mediaplayer） | < 0.2 s | miplayer 要 0.35 s |
+| **首字延迟（说完→出声）** | **0.88~1.55 s（中位 ~1.2 s）** | 见下方说明 |
+| 段间衔接缝 | ~0.3 s | 落在句子之间，听感接近自然停顿 |
+
+**首字延迟的构成**（典型一轮）：
+
+```
+大模型首字 0.9s  +  首句合成 0.2s  +  起播 0.15s  ≈ 1.25s
+```
+
+带工具调用的轮次会明显更慢（实测调天气工具那轮 3.10 s，多出来的全是 `wttr.in` 的
+网络往返）。
+
+**不同做法的对比**（同一批问题，实测）：
+
+| 做法 | 首字 | 段间 | 结论 |
+|---|---|---|---|
+| EdgeTTS 流式（原始方案） | ~3.2 s | 无 | 慢在每句 1.05~1.19 s 的云端合成，且逐句串行 |
+| 原生 TTS + 现状服务端 | ~3.9 s | 0.4 s/段 | 最差：在 EdgeTTS 等待上又加了合成和起播 |
+| 原生 TTS + 只发文字 + PCM 实时推流 | ~2.4 s | 断流 | 设备扛不住实时推流，反复 `send stalled` |
+| **原生 TTS + 只发文字 + 整段播放**（现行） | **~1.2 s** | ~0.3 s | 稳定，0 断流 |
 
 ---
 
@@ -83,181 +123,129 @@ xiaozhi-server 收到整句音频后：
 
 ### 3.1 唤醒词
 
-- 主词 **你好小七**，备用 **小七小七**
-- `keywords_score: 3.0`（上游写死 2.0）、`keywords_threshold: 0.20`、`max_active_paths: 8`
-- 用真实录音做的离线回归（同一批 4 条真人「你好小七」+ 74 条真实负样本）：
+- 关键词：`你好小七`、`小七小七`（叠词召回差，主力用前者）
+- `keywords_score: 3.0`、`keywords_threshold: 0.20`、`max_active_paths: 8`
+- 打分/阈值改成读 `config.py`（镜像里写死 2.0，唤不醒）
+- 回归脚本：`bridge/kws_verify.py`（改参数后先跑这个）
 
-| 配置 | 命中 | 误唤醒 |
-|---|---|---|
-| 小七小七 · 打分 2.0 | 1/4 | 0 |
-| 你好小七 · 打分 2.0 | 3/4 | 0 |
-| **你好小七 · 打分 3.0** | **4/4** | 1（"你好小齐"，同音） |
+### 3.2 唤醒提示语与告别语
 
-**两个反直觉的点**：
-1. `max_active_paths` 调大反而掉召回（8→16 时 4/4 → 2/4）
-2. `keywords.txt` 里逐行的 `:boost` 在这个 sherpa-onnx 版本**不生效**，只能改全局值
-   → 所以加了 `deploy/xiaoqi/bridge/kws_sherpa.py` 从 config 读参数
-
-### 3.2 唤醒提示语
-
-- 内容「我在」，0.53 秒，**24 kHz 单声道 s16le**
+- 「我在」**0.54 秒**、「主人再见，拜拜」**1.51 秒**，24 kHz 单声道 s16le
 - 必须 24k：设备播放通道是 24k，用 16k 会变速变调（听起来"换了个人"）
-- 生成方式和**服务端完全相同的 EdgeTTS 参数**（`zh-CN-XiaoxiaoNeural` + `rate:+0%` + `volume:+50%` + `pitch:+0Hz`），
-  在 `xiaozhi-server` 容器里合成 mp3，再用 ffmpeg 转 24k/单声道/s16le 裸 PCM：
+- **用设备自己的 mibrain 生成**，和服务端对话同一个音色，不会再出现"提示语一个声音、回答另一个声音"：
 
   ```bash
-  docker exec xiaozhi-server python -c "
-  import asyncio, edge_tts
-  async def m(): await edge_tts.Communicate('我在','zh-CN-XiaoxiaoNeural',
-      rate='+0%', volume='+50%', pitch='+0Hz').save('/tmp/p.mp3')
-  asyncio.run(m())"
-  docker cp xiaozhi-server:/tmp/p.mp3 /tmp/p.mp3
-  ffmpeg -y -i /tmp/p.mp3 -ar 24000 -ac 1 -f s16le deploy/xiaoqi/bridge/prompt.pcm
+  ubus call mibrain text_to_speech '{"text":"我在","save":1}'   # 在音箱上执行
+  # 取回 mp3 后：
+  ffmpeg -y -i prompt.mp3 -f s16le -acodec pcm_s16le -ac 1 -ar 24000 bridge/prompt.pcm
   ```
-- 告别语「主人再见，拜拜」同理（2.23 s），走同一条 PCM 通道
 
 ### 3.3 静音窗口（防"幽灵轮次"）
 
 唤醒提示语播放期间**直接掐掉麦克风**（不送 VAD）。
 
 原因：AEC 只削 27 dB，而 Silero VAD 是幅度归一化的，削完的残留人声照样打 **0.9+ 分**，
-和真人说话分布完全重叠（实测：回声 >0.9 的帧占 11~28%，真人 14~29%）。**任何阈值都分不开。**
+和真人说话分布完全重叠。**任何阈值都分不开。**
 
-窗口 = 提示语时长 + 0.8 s，并且会自动延长到「设备回采报告播放结束」（`echo_until`）。
+窗口 = 提示语时长 + 0.8 s，并会自动延长到「设备回采报告播放结束」（`echo_until`）。
 
 ### 3.4 连续对话
 
 - 回答完**不退出**，继续听 `timeout: 5` 秒
 - 有人说话就续期，一直没人说话才静默退出（不播告别语）
-- 倒计时可被"出声"刷新（`note_voice`）
+- 说「拜拜」「再见」「退出吧」立即播告别语退出
 
 ### 3.5 灯环
 
-| 状态 | 颜色 | 样式 |
-|---|---|---|
-| 唤醒 | 白→金 | 从 12 点向外铺开 + 白闪（一次性） |
-| **在听** | **青白** | 一个亮头带长尾绕圈扫描，底光很暗 |
-| 快超时 | **橙色** | 两短一停的心跳 |
-| 在想 | **紫色** | 两个光点反向对流 |
-| 在说 | **蓝色** | 整环呼吸 |
-| 连接中 | 白色 | 单点亮珠跑马 |
-| 出错 | 红色 | 闪两下 |
+7 种状态，配色刻意拉开差异，扫一眼能分辨（`device/led_frames/*.txt`，18 颗灯）：
 
-帧文件在 `deploy/xiaoqi/device/led_frames/`，由 `gen_led_frames.py` 生成，推到设备
-`/data/open-xiaoai/led_frames/`。设备端 `led.sh` 只做 read+write，省 CPU。
+| 状态 | 颜色 | 动画 |
+|---|---|---|
+| 唤醒 | 白→金 | 从 12 点向外扩散（一次性） |
+| 聆听 | 青白 | 一个亮头绕圈扫描 |
+| 没听清 | 橙 | 两短一停的心跳 |
+| 思考 | 紫 | 两个光点反向对流 |
+| 说话 | 蓝 | 整环呼吸 |
+| 忙 | 白 | 单点亮珠跑马 |
+| 出错 | 红 | 闪两下 |
 
 ### 3.6 打断（barge-in）
 
-小七说话时喊「你好小七」→ 立刻停、灯转青白扫描、接着听。**已修好，实测可用。**
-
-三道过滤条件：
-
-| 条件 | 值 | 说明 |
-|---|---|---|
-| `echo_reference` | true | 设备同时发回播放回采，桥接据此消回声 |
-| `barge_in_ready()` | — | 回采在 2 s 内有更新才允许打断 |
-| `near_end_min_db` | **−17** | 消完回声后剩下的人声 / 被消掉的回声；低于它当"自己的声音"忽略 |
-
-实测近端值：**+7.5 dB / −1.5 dB**（与 `aec.py` 注释里的 −13/−20 不是同一量级，别照抄）。
+- 说话时喊唤醒词 → 立刻停播、响一下、听新问题
+- 三个必要条件（都踩过坑）：
+  1. **检测时刻**的设备状态要随唤醒一起传下去（异步派发时状态早变了）
+  2. 近端能量阈值：LX06 实测 +7.5 / −1.5 dB，取 `near_end_min_db: -17`
+  3. 停播要真的调到播放器（常驻 mediaplayer 用 `player_play_operation stop`）
 
 ### 3.7 声纹识别
 
-**采集侧**（桥接）：每句话算一次 192 维 embedding，写 `speakers.jsonl`；
-同时在对话记录里写一条 `{"role":"speaker","file":...,"name":...,"score":...}`。
-
-**识别侧**（服务端）：xiaozhi-server 自带 voiceprint 模块，每句话**并行**调
-`POST /voiceprint/identify`，拿到名字后注入系统提示词：
-
-```xml
-<speakers_info>
-当前说话人：示例用户
-- 示例用户：家里的男主人
-</speakers_info>
-```
-
-实现：`deploy/xiaoqi/bridge/voiceprint_svc.py`（NAS 上，CAM++ + 管理页登记的**设备录音**）
-
-**判定**：
-
-- 声纹服务只返回相似度，阈值在服务端配置（`similarity_threshold: 0.45`）
-- 桥接侧另有一套规则用于页面标签：`≥0.45` 直接认；同一轮对话里刚确认过的人，
-  下一句 `≥0.38` 也认（`carry_threshold`），解决"唱首歌"那次 0.424 的漏判
-
-**实测数据（同一个人、同一段音频对比两种登记方式）**：
-
-| 登记方式 | 真人语音分数 | 杂音 | 间隔 |
-|---|---|---|---|
-| **设备录**（对小七说） | **0.50 ~ 0.76** | ≤0.38 | **0.12** |
-| 手机录（上传） | 0.27 ~ 0.62 | ≤0.23 | **0.04** |
-
-手机录系统性低 **0.17**，间隔只剩 0.04 —— 多人场景必错。
-**结论：门禁级别的识别必须用设备录。**
-
-> 域迁移（把手机声纹映射到设备域）做过留一验证，平均 +0.194 有效，
-> 但**跨人迁移没验证过**（只有一个登记人），暂不做。
+- 模型：CAM++（3D-Speaker，192 维，28 MB），`sherpa_onnx.SpeakerEmbeddingExtractor`
+- 只使用**设备录的**片段做底库（手机上传的域差太大：中位相似度 0.237，设备录的是 0.50~0.76）
+- 服务端每句并行调 `POST /voiceprint/identify`，把「当前说话人：X」注入提示词
+- 阈值 0.45；当前只登记了一个人，所以"认错人"的概率还测不了
 
 ### 3.8 网页
 
-| 页面 | 地址 | 作用 |
+| 页面 | 地址 | 用途 |
 |---|---|---|
-| 对话记录 | http://<NAS_IP>:8098 | 每轮文字 + 原始录音 + **说话人标签** |
-| 声纹管理 | http://<NAS_IP>:8097 | 加人、录/上传、试匹配 |
-| 声纹管理（HTTPS） | https://<NAS_IP>:8444 | 同上，**网页录音必须走这个** |
+| 对话记录 | `http://<NAS_IP>:8098` | 每轮文字 + 原始录音 + 说话人标签 |
+| 声纹管理 | `http://<NAS_IP>:8097` | 加人、录/上传、试匹配 |
+| 声纹管理（HTTPS） | `https://<NAS_IP>:8444` | 同上，**网页录音必须走这个** |
 
-> 浏览器只在 HTTPS 或 localhost 下允许 `getUserMedia`。
-> `http://` + 内网 IP 时 `navigator.mediaDevices` 是 `undefined`。
+> `http://` + 内网 IP 时浏览器的 `navigator.mediaDevices` 是 `undefined`，录音按钮不可用。
+
+### 3.9 原生音色 TTS（本轮重做的部分）
+
+**服务端**：`TTS: TextOnly`（自写的 provider，`bridge/textonly_tts.py`）。
+
+它只做一件事：把每句文字立刻放进发送队列，音频位置塞一段 60 ms 静音占位。
+为什么需要它：上游服务端是「先合成音频，再把文字和音频一起下发」，桥接要多等
+**1.05~1.19 s** 的云端合成才能拿到文字。换成 TextOnly 后文字随大模型输出立刻到达。
+
+**桥接侧**（`bridge/native_tts_pcm.py`，覆盖镜像里的 `services/native_tts.py`）：
+
+| 环节 | 实现 | 为什么 |
+|---|---|---|
+| 合成 | 每句一次 `ubus call mibrain text_to_speech`，4 路并发 | 设备实测：串行 1.28 s，并行 0.35 s；每段少一次 RPC（不再搬文件） |
+| 交付 | 按顺序、合成完一段就交给播放 | "等全部合成完"会让首句干等长回答的最后一句 |
+| 播放 | `cat` 拼成一个 mp3 → `ubus call mediaplayer player_play_url file://…` | 常驻守护进程，起播 < 0.2 s；播放期间设备只读本地文件 |
+| 收尾 | 按估算时长睡（多留 0.2 s） | 轮询状态每次都是一次 RPC，光排队就带来 0.35 s 衔接缝 |
+| 打断 | `player_play_operation {"action":"stop"}` | 比 kill 进程更干脆 |
+
+**首句优先**（`XIAOQI_FIRST_SENTENCE_PLAY=1`，默认开）：第一句合成完立刻播，
+其余边播边合成。首字从 ~3 s 降到 ~1.2 s，代价是段间有约 0.3 s 衔接缝。
+不想要这个缝就设成 `0`，回到"整段一次播"（首字 ~3 s，绝对无缝）。
 
 ---
 
 ## 4. 关键参数速查
 
-`deploy/xiaoqi/bridge/config.py`：
+载体：`bridge/config.py`（挂载进容器，改完要 `--force-recreate bridge`）
 
-```python
-wakeup:
-  keywords: ["你好小七", "小七小七"]
-  keywords_score: 3.0          # 上游写死 2.0，实测 3.0 才能 4/4
-  keywords_threshold: 0.20
-  keyword_thresholds: {"小七小七": 0.30}
-  max_active_paths: 8          # 调 16 反而掉召回
-  stream_offsets_ms: [0]
-  timeout: 5                   # 连续对话倾听窗口（秒）
+| 参数 | 现值 | 说明 |
+|---|---|---|
+| `keywords` | `["你好小七","小七小七"]` | 唤醒词 |
+| `keywords_score` | 3.0 | 触发分 |
+| `keywords_threshold` | 0.20 | 检出阈值 |
+| `keyword_thresholds` | `{"小七小七":0.30}` | 单关键词覆盖（叠词误报多） |
+| `wakeup.timeout` | 5 | 连续对话等待秒数 |
+| `barge_in.near_end_min_db` | -17.0 | 打断的近端能量阈值 |
+| `capture.channels` | 8 | 设备采集声道数 |
+| `capture.mic_channel` / `ref_channel` | 0 / 6 | 主麦 / 回声参考 |
+| `echo_canceller.taps` | 8 | AEC 抽头数 |
+| `tts_output.mode` | `native_xiaomi` | 原生音色；`sherpa` = 服务端音频流 |
+| `tts_output.native_xiaomi.target_chars` | 12 | 分段粒度（基本等于一句一段） |
+| `tts_output.native_xiaomi.prefetch_segments` | 4 | 预取段数 |
+| `speaker.threshold` | 0.45 | 声纹判定阈值 |
+| `music.enabled` | `false` | 本地音乐（还没接） |
 
-vad:
-  threshold: 0.10
-  min_silence_duration: 700
-  short_utterance_silence: 1300
-  prepend_lookback_ms: 600     # 补回"开口被吃掉"的部分
-  tts_end_guard_ms: 300
-  no_reply_prompt: ""          # 没听清时不出声，静默重听
+环境变量：
 
-barge_in:
-  echo_reference: True
-  near_end_min_db: -17.0       # 实测真人 +7.5/-1.5 dB
-  echo_vad_threshold: 0.7      # 播报余音期间提高 VAD 门槛
-  capture: {pcm: noop, channels: 8, sample_rate: 48000,
-            mic_channel: 0, ref_channel: 6, mic_shift: 16, ref_shift: 16}
-  echo_canceller: {taps: 8, tau_s: 3.0, output_gain: 256}
-
-speaker:                       # 桥接侧标签用
-  threshold: 0.45
-  min_seconds: 1.0
-  carry_threshold: 0.38
-  carry_window_s: 120
-
-music:
-  enabled: False               # 本地音乐还没开（需要挂歌单目录）
-```
-
-`deploy/xiaoqi/xiaozhi/data/.config.yaml` 里额外加了：
-
-```yaml
-voiceprint:
-  url: http://xiaoqi-voiceprint:8096/voiceprint/identify?key=xiaoqi
-  similarity_threshold: 0.45
-  speakers:
-    - "p_xxxxxxxx,示例用户,家里的男主人"    # ⚠️ 人员 id 变了要同步改
-```
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `XIAOZHI_TTS_OUTPUT_MODE` | `native_xiaomi` | 覆盖 `tts_output.mode` |
+| `XIAOQI_FIRST_SENTENCE_PLAY` | `1` | 首句优先播放开关 |
+| `PYTHONPATH` | `/app/pylibs` | soundfile/soxr 所在目录 |
 
 ---
 
@@ -267,19 +255,29 @@ voiceprint:
 
 | 文件 | 覆盖到 | 作用 |
 |---|---|---|
-| `bridge/config.py` | `/app/config.py` | 全部配置 + 唤醒提示语/告别语逻辑 |
+| `bridge/config.py` | `/app/config.py` | 全部配置 + 提示语/告别语逻辑 |
 | `bridge/event.py` | `/app/xiaozhi/event.py` | 会话状态机、录音落盘、声纹写入、打断 |
-| `bridge/xiaozhi_main.py` | `/app/xiaozhi/xiaozhi.py` | 灯环、STT 处理、TTS 门控 |
+| `bridge/xiaozhi_main.py` | `/app/xiaozhi/xiaozhi.py` | 灯环、STT 处理、TTS 门控、原生链路接入 |
 | `bridge/xiaoai.py` | `/app/xiaozhi/xiaoai.py` | AEC、metadata=null 修复 |
 | `bridge/stream.py` | `/app/xiaozhi/services/audio/stream.py` | 音频环形缓冲 + 录音 |
 | `bridge/vad_hook.py` | `/app/xiaozhi/services/audio/vad/__init__.py` | VAD + **提示语静音窗口** |
 | `bridge/config_util.py` | `/app/xiaozhi/utils/config.py` | OTA 带 Client-Id |
 | `bridge/kws_sherpa.py` | `/app/xiaozhi/services/audio/kws/sherpa.py` | 唤醒参数从 config 读 |
 | `bridge/kws_init.py` | `/app/xiaozhi/services/audio/kws/__init__.py` | 唤醒判定日志 + 用检测时刻的状态 |
+| `bridge/native_tts_pcm.py` | `/app/xiaozhi/services/native_tts_pcm.py` | **原生音色播放链路**（并行合成 + 整段播放） |
 | `bridge/speaker_id.py` | `/app/xiaozhi/speaker_id.py` | 声纹采集/标签 |
-| `bridge/prompt.pcm` | `/app/prompt.pcm` | 「我在」（24k） |
-| `bridge/farewell.pcm` | `/app/farewell.pcm` | 「主人再见，拜拜」（24k） |
+| `bridge/prompt.pcm` | `/app/prompt.pcm` | 「我在」（24k，0.54 s） |
+| `bridge/farewell.pcm` | `/app/farewell.pcm` | 「主人再见，拜拜」（24k，1.51 s） |
 | `bridge/models/campplus.onnx` | — | 声纹模型（28 MB） |
+| `bridge/pylibs/` | `/app/pylibs` | soundfile / soxr / cffi（无 pip 的镜像里补依赖） |
+
+### 服务端补丁
+
+| 文件 | 覆盖到 | 作用 |
+|---|---|---|
+| `bridge/textonly_tts.py` | `/opt/xiaozhi-esp32-server/core/providers/tts/textonly.py` | **只发文字、不合成**的 TTS provider |
+| `xiaozhi/plugins/get_weather.py` | 同名插件 | 天气换成 wttr.in（和风公共 key 已 401） |
+| `xiaozhi/data/.config.yaml` | `/opt/…/data/.config.yaml` | 选择模块、提示词、声纹配置 |
 
 ### 独立服务
 
@@ -287,10 +285,11 @@ voiceprint:
 |---|---|
 | `bridge/dialog_web.py` | 对话记录页（8098） |
 | `bridge/speaker_web.py` | 声纹管理页（8097/8444） |
-| `bridge/speaker_lib.py` | 声纹公共逻辑（模型、存储） |
+| `bridge/speaker_lib.py` | 声纹公共逻辑 |
 | `bridge/voiceprint_svc.py` | 声纹识别 HTTP 服务（8096） |
+| `bridge/tts_inbox.py` | TTS 收件服务（4398，当前链路已不使用，保留做备用） |
 | `bridge/speaker_report.py` | 离线观察工具（聚类/回填） |
-| `bridge/kws_eval.py` / `kws_verify.py` | 唤醒词离线回归脚本 |
+| `bridge/kws_eval.py` / `kws_verify.py` | 唤醒词离线回归 |
 
 ### 设备端
 
@@ -307,76 +306,83 @@ voiceprint:
 
 ### 6.1 音频采集
 
-| 现象 | 根因 | 解法 |
+| 现象 | 原因 | 解法 |
 |---|---|---|
-| 麦克风只有 −81 dBFS | 老客户端 `-f S16_LE` 抓不到 S32 的高位 | 换 fork 客户端，`-f S32_LE` |
+| 采到 −81 dBFS 的静音 | 客户端用了 `-f S16_LE` | 必须 `-f S32_LE` |
 | Silero 概率恒 0 | 用了 v4 模型 | 必须 v5（2.3 MB） |
+| 远场唤醒不稳 | 6 麦平均无收益，SNR 仅 4.8 dB | 只用 ch0，靠调阈值 |
 
 ### 6.2 唤醒
 
-| 现象 | 根因 | 解法 |
-|---|---|---|
-| 叠词「小七小七」叫不醒 | 模型对叠词召回差（1/4） | 换回「你好小七」（4/4） |
-| 调 `max_active_paths` 越调越差 | 6→8→16 呈非单调 | 保持 8 |
-| `keywords.txt` 改 `:3.0` 无效 | 该版本不支持逐行 boost | 改全局 + 挂 `kws_sherpa.py` |
+- 叠词「小七小七」斜召回差（1/4），换回「你好小七」后 4/4
+- `keywords.txt` 里逐行的 `:boost` 在这个 sherpa-onnx 版本**不生效**，只能改全局值
+- 镜像里 `keywords_score` 写死 2.0，必须挂载 `kws_sherpa.py` 才能唤醒
 
-### 6.3 TTS 音色
+### 6.3 TTS 音色与播放（本轮花了最久）
 
-| 现象 | 根因 | 解法 |
-|---|---|---|
-| 提示语和回复"不是一个人" | ①漏了服务端 `volume:+50%` ②告别语走的是设备自带 `tts_play.sh` | 用服务端同参数生成 PCM，告别语改走桥接 PCM 通道 |
-| 提示语变调/语速快 | 文件 16k、播放通道 24k | 统一 24k |
+**① 「LX06 没有 mibrain」是个错误结论。** 设备上 `mibrain_service` 一直在跑，
+`ubus call mibrain text_to_speech` 直接可用，vendor 是 `AiNiRobot`，30 字只要 0.12 s。
 
-### 6.4 幽灵轮次（把自己提示语当用户说话）
+**② 接入原生音色后反而更慢**，因为服务端是"先合成 EdgeTTS，再下发文字"：
+文字要等云端合成完才到桥接，原生链路的合成和起播全加在 1.1 s 之上。
 
-| 现象 | 根因 | 解法 |
-|---|---|---|
-| 唤醒后立刻出现"我说：你好主人" | Silero 归一化 + AEC 只削 27 dB，残留照样 0.9+ 分 | **播放期间硬静音 VAD**，播完再收音 |
+**③ 实时推 PCM 在这台设备上走不通。** 试了 60 ms 分片 + 350 ms 领先量，日志里反复出现：
+
+```
+⚠️ 播放缓冲见底 -275 ms
+❌ 已断开连接: send stalled for 10s
+```
+
+根因是设备在播音频时 load 6+、可用内存 5 MB，任何一次卡顿超过缓冲深度就断流；
+而且领先量超过设备 aplay 缓冲（200 ms）会反向顶死，连 WS 连接都被拖断。
+
+**④ 玩家进程开销不能忽略。** 每段 spawn 一次 `miplayer` 要 0.35 s 起播，四句话就是
+1.4 s 的空档；换成常驻 `mediaplayer` 守护进程后 < 0.2 s，而且播放与桥接解耦。
+
+**⑤ 设备 RPC 是稀缺资源。** 单次 `run_shell` 在设备忙时要 0.3~0.5 s。
+上游实现每段两次 RPC（ubus + mv/wc），四句话排八次队就是两秒多。
+把"搬文件""量大小""删文件"全部合并/批量化之后，合成阶段从 2.09 s 降到 0.32 s。
+
+**⑥ 交付时机比合成速度更重要。** 即使并行合成，如果"等全部文本 + 全部合成完再交给
+播放器"，长回答的首句仍然要等到最后一句合成完。改成"合成完一段就按顺序交付"后，
+首句 80 ms 就能开播。
+
+**⑦ 查播放状态不如按时长等。** 每次 `player_get_play_status` 都是一次 RPC，
+光排队就带来 0.35 s 的段间衔接缝；音频是恒定 32 kbps，按时长估算误差只有十几毫秒，
+直接睡更划算。
+
+### 6.4 幽灵轮次
+
+AEC 只削 27 dB，Silero 幅度归一化后残留人声照样 0.9+ 分，和真人分布完全重叠。
+**只能硬静音**，没有阈值可调。
 
 ### 6.5 打断（花了最久）
 
-**三层故障串在一起，每修一个才露出下一个：**
+三层故障串在一起，每修一层才露出下一层：
 
-1. `near_end_min_db` 写成正数 `8.0` → 真实打断全被判成"自己的声音"
-2. 判定用的状态在**异步派发时**才读 → 那时小七已说完，状态变了被当过期结果丢弃
-   → 改成在**检测那一刻**把 `device_state` 一起传下去
-3. **`_stop_prompt(speaker)` 里的 `speaker` 从来没赋值** → `NameError`
-   → 而它是 `asyncio.run_coroutine_threadsafe` 调起的，**异常存进 Future 无人读取**，
-   静默崩溃。表现就是"喊了完全没反应"
+1. `near_end_min_db` 写成正数 8.0 → 真实打断全被判成"自己的声音"
+2. 状态在**异步派发时**读取 → 那时小七已说完，结果被当过期丢弃
+3. `_stop_prompt(speaker)` 里 `speaker` 从未赋值 → `NameError`，又被
+   `run_coroutine_threadsafe` 静默吞掉 → 表现为"喊了完全没反应"
 
-> **教训：** 遇到"完全没反应"先想办法把异常打出来，别去猜阈值。
-> 给 `barge_in` 包一层 try/except 打印 traceback 是解决问题的关键一步。
-
-**排查手段**（已内置）：`kws_init.py` 会打印
-
-```
-🔎 KWS命中 '你好小七' rev 4/4 mode=active state=speaking barge_ready=True paused=False -> 处理
-```
+> 教训：遇到"完全没反应"，先想办法把异常打出来，别去猜阈值。
 
 ### 6.6 声纹
 
-| 现象 | 根因 | 解法 |
-|---|---|---|
-| 手机录的声纹搬到音箱上完全认不出（中位 0.237） | 通道差异（麦克风/距离/混响/AEC） | **必须设备录** |
-| 短句漏判（"唱首歌" 0.424） | 短句 + 语气变化，单人阈值会漏 | 连续对话内放宽到 0.38 |
-| 录入了但问"我是谁"答不上 | 桥接只做了**记录**，从没告诉大模型 | 接服务端原生 voiceprint 接口 |
+- 手机上传的音频拿去当底库**完全不可用**（中位相似度 0.237，和不认识的人分不开）
+- 必须用音箱自己录的片段（0.50~0.76 真实 / ≤0.38 噪声）
+- 服务端启动时会缓存声纹服务健康检查 10 分钟，顺序上要先把 `voiceprint` 拉起来
 
 ### 6.7 设备资源
 
-LX06 只有 **118 MB 内存**，常态剩 5~8 MB，load 6~10。
-我做 8 声道 × 16 kHz 实时采集时直接把它压垮：**OOM killer 连杀了 29 次**
-小爱的 `MdsWakeup` / `mipns-xiaomi`，小爱整整 8 分钟不能唤醒。
-
-> **教训：不要在这台音箱上做任何额外的实时音频处理。**
-> 能搬到 NAS 的一律搬。
+- 118 MB 可用内存、播音频时 load 6+、可用内存 5 MB
+- 8 声道实时采集会 OOM 杀掉小爱引擎（`MdsWakeup`/`mipns-xiaomi`），只能重启 `/etc/init.d/pns`
+- **不要在设备上做实时多路 DSP**
 
 ### 6.8 运维
 
-- **改 `config.py` 必须 `up -d --force-recreate`**，`restart` 不刷新挂载
-- 设备 `/tmp` 是 tmpfs，重启就没了，测试 wav 会消失
-- `aplay -q` 会静默失败，排查时去掉 `-q`
-- 开着 `echo_reference` 时，`aplay` 播的声音会被 AEC 消掉，**没法做合成唤醒测试**
-- 设备 SSH 要 `-oHostKeyAlgorithms=+ssh-rsa`，密码 `open-xiaoai`
+- 挂载进容器的 Python 文件**不会热更新**，必须 `--force-recreate`
+- 容器重建会丢失 `docker exec` 里装的东西（依赖要放在挂载目录里）
 
 ---
 
@@ -386,8 +392,10 @@ LX06 只有 **118 MB 内存**，常态剩 5~8 MB，load 6~10。
 2. **单人声纹**：只登记了一个人，"认错人"的概率还没法测
 3. **人物 id 写死**：`.config.yaml` 里的 `p_xxxxxxxx` 在管理页删人重建后会失效
 4. **音乐功能未启用**：`music.enabled: false`，说"放首歌"只有回复没有声音
-5. **打断尾音**：`abort_tts_output()` 在 sherpa 模式下是空实现，靠关流停声，尾音有 0.3~0.5 s
-6. **声纹只在每轮开头有效**：服务端要求音频 > 28800 字节（约 0.9 s），太短的句子不认
+5. **设备连接偶发抖动**：3 小时 4 次断连（`nothing received for 15s` / `Connection reset`），
+   会自动重连，但断的瞬间唤醒是死的
+6. **工具调用拖慢首字**：调天气那轮 3.10 s，多出来的全是外部网络往返
+7. **声纹只在每轮开头有效**：服务端要求音频 > 28800 字节（约 0.9 s），太短的句子不认
 
 ---
 
@@ -395,31 +403,24 @@ LX06 只有 **118 MB 内存**，常态剩 5~8 MB，load 6~10。
 
 按性价比排序：
 
-1. **补第二个人的声纹**（妈妈）
-   → 能算"认错率"和"top1-top2 margin"，这才叫真正的准确率
-2. **声纹影响对话**：现在已经注入 `<speakers_info>`，可以进一步做
-   - 称呼（"早，爸爸"）
-   - 儿童模式（识别到小孩换简单表达）
-   - 个人偏好记忆
-3. **打开本地音乐**：挂一个歌单目录 → `music.enabled: true` → 支持"放首歌/下一首/暂停"
-   （已有的"说话时音乐降 20 dB"逻辑会自动生效）
-4. **降低远场噪声**：
-   - 桥接侧加 WebRTC APM 的 NS/AGC（不碰设备，可控可回退）
-   - 或者评估波束成形（要重编译客户端，收益不确定）
-5. **唤醒词再调**：现在 4/4 命中，但 74 条真实负样本里有 1 条误唤醒（"你好小齐"，同音字）。
-   可以补充更多负样本做回归，或评估加第二个词做二次确认
-6. **声纹自适应**：每次识别成功的高分片段自动补进质心（解决时间漂移）
+1. **本地音乐** —— 曲库 121 GB / 4425 首现成（4309 flac + 77 mp3 + 39 wav），
+   设备播放器现成，改 `music.enabled` + 加一个意图钩子即可
+2. **Home Assistant 接入** —— A 档：服务端内置 hass 插件，查状态 + 开关灯
+3. **多人声纹** —— 补登记妈妈，才能测出"认错率"
+4. **声纹驱动行为** —— 称呼、儿童模式、个人偏好
+5. **设备连接稳定性** —— 减少那 4 次/3 小时的断连
+6. **工具调用提速** —— 天气/新闻这类外部请求是最慢的一环
 
 ---
 
 ## 9. 常用命令
 
 ```bash
-# 看桥接日志（含唤醒/打断/声纹判定）
+# 看桥接日志（唤醒/打断/合成/播放耗时）
 docker logs -f xiaoai-bridge
 
-# 改了 config.py / event.py 后必须重建
-cd stack && docker compose up -d --force-recreate bridge
+# 改了 config.py / event.py / native_tts_pcm.py 后必须重建
+docker compose up -d --force-recreate bridge
 
 # 改了网页/声纹服务
 docker compose restart dialog-web speaker-web voiceprint
@@ -427,35 +428,33 @@ docker compose restart dialog-web speaker-web voiceprint
 # 改了 .config.yaml（服务端配置）
 docker compose restart xiaozhi-server
 
-# 看声纹识别实时结果
-docker logs -f xiaoqi-voiceprint
+# 唤醒词离线回归（改 keywords.txt 或阈值后先跑）
+docker compose exec bridge python /app/xiaozhi/kws_verify.py
 
-# 唤醒词离线回归（容器内跑）
-docker exec xiaoai-bridge /app/.venv/bin/python /tmp/kwseval/kws_verify.py
-
-# 声纹数据观察
-docker exec xiaoai-bridge /app/.venv/bin/python /app/speaker_report.py
+# 声纹数据观察（聚类 / 回填历史录音）
+docker compose exec bridge python /app/speaker_report.py
 
 # 备份
-tar czf backup-$(date +%F).tgz deploy/xiaoqi/logs deploy/xiaoqi/xiaozhi/data/.config.yaml deploy/xiaoqi/bridge
+tar czf backup-$(date +%F).tgz logs xiaozhi/data/.config.yaml bridge
 ```
 
 ---
 
 ## 10. 一次性验证过的关键数字
 
-留作回归基线：
-
-| 指标 | 值 |
-|---|---|
-| 唤醒词命中（你好小七） | 4/4（打分 3.0 / 阈值 0.20） |
-| 唤醒提示语时长 | 0.53 s（24k） |
-| 静音窗口 | ≈1.3 s（提示语 + 0.8 s） |
-| ASR → 首句音频延迟 | ≈1.6 s（整体 2~3 s） |
-| AEC 回声抑制 | ≈27 dB |
-| 打断近端值 | +7.5 / −1.5 dB |
-| 远场语音 SNR（ch0） | 4.8 dB |
-| 声纹 embedding 耗时 | ≈110 ms / 句 |
-| 声纹同人相似度（设备录） | 0.50 ~ 0.76 |
-| 声纹异人/杂音 | ≤0.38 |
-| 设备内存 | 118 MB 总 / 常态剩 5~8 MB |
+| 项目 | 数值 | 日期 |
+|---|---|---|
+| 唤醒成功率（你好小七） | 4/4 | 11-02 |
+| 唤醒提示语时长 | 0.54 s | 11-04 |
+| 告别语时长 | 1.51 s | 11-04 |
+| AEC 回声抑制 | ~27 dB | 11-02 |
+| 声纹 embedding 耗时 | ~110 ms | 11-03 |
+| 声纹识别（设备录音，真实） | 0.50~0.76 | 11-03 |
+| mibrain 合成（30 字，空闲） | 0.12 s | 11-04 |
+| 并行 vs 串行合成（4 句） | 0.35 s vs 1.28 s | 11-04 |
+| mediaplayer 起播 | < 0.2 s | 11-04 |
+| miplayer 起播（对照） | ~0.35 s | 11-04 |
+| **首字延迟（纯对话）** | **0.88~1.55 s，中位 ~1.2 s** | 11-04 |
+| 首字延迟（带工具调用） | 3.10 s | 11-04 |
+| 段间衔接缝 | ~0.3 s | 11-04 |
+| 稳定性（近 3 小时） | 0 断流 / 0 播放失败 | 11-04 |

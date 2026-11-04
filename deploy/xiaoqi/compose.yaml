@@ -18,10 +18,14 @@ services:
       - ./xiaozhi/models:/opt/xiaozhi-esp32-server/models
       # 用 wttr.in 版天气插件替换镜像里的和风实现（新版 key 需要专属 Host）
       - ./xiaozhi/plugins/get_weather.py:/opt/xiaozhi-esp32-server/plugins_func/functions/get_weather.py:ro
+      # 只发文字、不合成音频的 TTS provider：文字随大模型输出立刻下发，
+      # 合成交给音箱本地 mibrain（省掉云端 EdgeTTS 的 1.05~1.19 s/句）
+      - ./bridge/textonly_tts.py:/opt/xiaozhi-esp32-server/core/providers/tts/textonly.py:ro
 
   # 桥接：小爱音箱(4399) ↔ 小智(xiaozhi-server)
   bridge:
-    image: local/open-xiaoai-xiaozhi:barge-in
+    # pcm-buf: 设备侧 aplay 缓冲从 200ms 加深到 600ms（取音频 RPC 卡顿几百毫秒也不会断流）
+    image: local/open-xiaoai-xiaozhi:pcm-buf
     container_name: xiaoai-bridge
     restart: unless-stopped
     depends_on:
@@ -32,10 +36,17 @@ services:
       - DUMP_UTTERANCE=1
       - DIALOG_LOG=/data/logs/dialog.jsonl
       - UTTERANCE_DIR=/data/logs/utterances
-      # LX06 上没有 mibrain，用不了 native_xiaomi；走服务端 TTS（EdgeTTS）音频流
-      - XIAOZHI_TTS_OUTPUT_MODE=sherpa
+      # LX06 实测 `ubus call mibrain text_to_speech` 可用（30 字约 0.12 s），
+      # 走小爱原生音色。服务端那边配的是 TextOnly，不会再有云端合成。
+      - XIAOZHI_TTS_OUTPUT_MODE=native_xiaomi
+      # soundfile/soxr 装在挂载目录里（镜像里没有 pip，免得为了两个小包重建镜像）
+      - PYTHONPATH=/app/pylibs
+      # 首句优先播放：首字从 ~3s 降到 ~1.5s，代价是段间有一次 ~0.3s 衔接缝。
+      # 不想要这个缝就删掉下面这行（或改成 0），回到"整段一次播"。
+      - XIAOQI_FIRST_SENTENCE_PLAY=1
     ports:
       - "4399:4399"   # 音箱拨入
+      - "4398:4398"   # TTS 收件服务（备用：早期"取回 NAS 解码"方案用的，当前链路不用）
       - "4400:4400"   # 本地音乐（先不开，占位）
     volumes:
       - ./bridge/config.py:/app/config.py:ro
@@ -49,6 +60,10 @@ services:
       # 人声续期：任何一帧语音都刷新倒计时
       - ./bridge/vad_hook.py:/app/xiaozhi/services/audio/vad/__init__.py:ro
       - ./bridge/xiaozhi_main.py:/app/xiaozhi/xiaozhi.py:ro
+      # 原生音色播放链路：并行合成 + 按顺序尽早交付 + 整段拼接 + 常驻 mediaplayer 播放
+      - ./bridge/native_tts_pcm.py:/app/xiaozhi/services/native_tts_pcm.py:ro
+      - ./bridge/tts_inbox.py:/app/tts_inbox.py:ro
+      - ./bridge/pylibs:/app/pylibs:ro
       # 唤醒词打分/阈值改成读 config（镜像里写死 keywords_score=2.0，唤不醒）
       - ./bridge/kws_sherpa.py:/app/xiaozhi/services/audio/kws/sherpa.py:ro
       - ./logs:/data/logs
@@ -67,7 +82,8 @@ services:
       - ./logs/speakers:/data/speakers
       - ./bridge/speaker_report.py:/app/speaker_report.py:ro
     # 唤醒词文件用 gen_keywords.py 预生成，跳过镜像里需要 bpe.model 的生成步骤
-    command: ["/bin/bash", "-c", "source /app/.venv/bin/activate && exec python main.py"]
+    # 两个进程都用绝对路径，避免 activate 只作用于后台子 shell
+    command: ["/bin/bash", "-c", "/app/.venv/bin/python /app/tts_inbox.py & exec /app/.venv/bin/python main.py"]
 
   # 声纹识别服务：给小智服务端的 voiceprint 接口用（CAM++ + 管理页登记的设备录音）
   voiceprint:

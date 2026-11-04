@@ -63,8 +63,8 @@ async fn audio_watchdog() {
                     bits_per_sample: 16,
                     sample_rate: 24000,
                     // Keep enough audio queued to absorb Wi-Fi and scheduler jitter.
-                    period_size: 960,  // 40 ms at 24 kHz
-                    buffer_size: 4800, // 200 ms at 24 kHz
+                    period_size: 960,   // 40 ms at 24 kHz
+                    buffer_size: 14400, // 600 ms at 24 kHz（原生 TTS 取音频时设备会卡顿几百毫秒，缓冲要够深）
                 })),
                 None,
             )

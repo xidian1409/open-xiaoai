@@ -15,7 +15,7 @@
 |---|---|---|
 | `bridge/config.py` | `/app/config.py` | 唤醒词换成 `你好小七`；打分/阈值/候选路径全部可配（`keywords_score` 3.0、`keywords_threshold` 0.20、`max_active_paths` 8）；开启 AEC 参考、近端抑制 `near_end_min_db` −17 dB；新增 `speaker.*`（声纹）、提示语/告别语 PCM 与对应 `before_wakeup` / `after_wakeup` 逻辑 |
 | `bridge/event.py` | `/app/xiaozhi/event.py` | 回答完**不退出**，改成连续听 `wakeup.timeout` 秒；每次进入聆听打灯；修复打断（检测时刻状态判定、`speaker` 变量未赋值导致的 `NameError`）；每轮原始语音落盘；声纹结果写入对话日志 |
-| `bridge/xiaozhi_main.py` | `/app/xiaozhi/xiaozhi.py` | 接入灯环状态机（`_led` / `_send_led` / 超时回收）；TTS 直出模式下的输出门控 |
+| `bridge/xiaozhi_main.py` | `/app/xiaozhi/xiaozhi.py` | 接入灯环状态机（`_led` / `_send_led` / 超时回收）；TTS 直出模式下的输出门控；把原生 TTS 换成并行合成 + 整段播放的实现（导入失败自动回退 miplayer） |
 | `bridge/xiaoai.py` | `/app/xiaozhi/xiaoai.py` | AEC 打通；`metadata` 为 `null` 时的 `AttributeError` 兜底 |
 | `bridge/stream.py` | `/app/xiaozhi/services/audio/stream.py` | 音频环形缓冲 + 整轮录音落盘 |
 | `bridge/vad_hook.py` | `/app/xiaozhi/services/audio/vad/__init__.py` | **提示语播放期间硬静音 VAD**（`mute_for_prompt`），并把任何一帧人声当续期信号 |
@@ -23,6 +23,7 @@
 | `bridge/kws_init.py` | `/app/xiaozhi/services/audio/kws/__init__.py` | 唤醒判定打日志；用**检测时刻**的设备状态决定是否打断（异步派发时状态早就变了） |
 | `bridge/config_util.py` | `/app/xiaozhi/utils/config.py` | OTA 请求补 `Client-Id`（xiaozhi-server 0.9.x 缺了会返回「OTA请求ClientID为空」） |
 | `bridge/models/keywords.txt` | `/app/xiaozhi/models/keywords.txt` | 用 `gen_keywords.py` 重新生成（`你好小七` / `小七小七`） |
+| `examples/xiaozhi/src/server.rs` | 编进桥接镜像 | **设备侧 aplay 缓冲 200 ms → 600 ms**（`buffer_size: 4800 → 14400`）。原生音色播放大块音频时，200 ms 缓冲太浅 |
 
 ## 二、新增文件
 
@@ -31,6 +32,7 @@
 | 文件 | 作用 |
 |---|---|
 | `bridge/speaker_id.py` | 声纹采集 worker：CAM++ 提 192 维 embedding，写 `speakers.jsonl` 和对话日志 |
+| `bridge/native_tts_pcm.py` | **原生音色播放链路**：并行合成（4 路，实测 1.28 s → 0.35 s）、按顺序尽早交付、`cat` 整段拼接、常驻 `mediaplayer` 播放（起播 < 0.2 s）、首句优先开关 |
 | `bridge/gen_keywords.py` | 中文唤醒词 → 拼音 token，生成 `keywords.txt`（绕过镜像里对 `bpe.model` 的依赖） |
 | `bridge/prompt.pcm` / `bridge/farewell.pcm` | 唤醒应答「我在」（0.53 s）与退出语「主人再见，拜拜」（2.23 s），**24 kHz** |
 
@@ -39,6 +41,7 @@
 | 文件 | 端口 | 作用 |
 |---|---|---|
 | `bridge/voiceprint_svc.py` | 8096 | 声纹识别 HTTP 服务，供服务端 `voiceprint` 接口调用 |
+| `bridge/tts_inbox.py` | 4398 | TTS 收件服务：设备把 mibrain 合成的 mp3 POST 回来（当前链路已不用，保留做备用） |
 | `bridge/speaker_web.py` | 8097 / 8444 | 声纹管理页：加人、录音、上传、试匹配 |
 | `bridge/speaker_lib.py` | — | 声纹公共逻辑（模型加载、存储、相似度） |
 | `bridge/dialog_web.py` | 8098 | 对话记录页：每轮文字 + 录音 + 说话人标签 |
@@ -62,9 +65,37 @@
 | 文件 | 作用 |
 |---|---|
 | `xiaozhi/data/.config.example.yaml` | 只写需要覆盖的项（模板，`api_key` 等留空） |
+| `bridge/textonly_tts.py` | **只发文字、不合成**的 TTS provider。上游是「先合成再下发文字」，桥接要白等 1.05~1.19 s 的云端合成；换掉之后文字随大模型输出立刻到达 |
+| `.config.example.yaml` 里的 `TTS: TextOnly` | 选上面那个 provider，并精简 `Intent.function_call.functions` 到 2 个 |
 | `xiaozhi/plugins/get_weather.py` | 天气插件换成 wttr.in（原实现依赖和风天气，公共 key 已 401） |
 
-## 三、没有改的部分
+## 三、TTS 输出链路换成原生音色
 
-`packages/client-rust`、`packages/client-patch`、`examples/` 下的其余示例都没动。
+上游只有两种输出：服务端合成音频流（`sherpa`），或设备端 `mibrain` 合成 + `miplayer`
+每段起播（`native_xiaomi`）。后者每段要 spawn 一次播放器（~0.35 s），四句话就是 1.4 s
+的空档。这里的做法是：
+
+```
+大模型出句 → 服务端只发文字（TextOnly provider）
+          → 桥接每句起一个 mibrain 合成任务（4 路并发）
+          → 合成完一段就按顺序交付
+          → 第一句立刻用常驻 mediaplayer 播；其余边播边合成
+          → 凑齐后 cat 成一个 mp3 接续播放
+```
+
+三条实测结论（详见 DESIGN.md 第 2.5、6.3 节）：
+
+- **不要实时推 PCM**：设备播音频时 load 6+、可用内存 5 MB，实测反复 `send stalled for 10s`;
+  播放期间让设备只读本地文件才稳
+- **RPC 是稀缺资源**：设备忙时单次 `run_shell` 要 0.3~0.5 s，每段两次 RPC 就是两秒
+- **交付时机比合成速度重要**：等全部合成完再播，长回答的首句会被最后一句拖住
+
+效果：首字延迟从 3.2 s 降到 **0.88~1.55 s（中位 ~1.2 s）**，段间缝隙 ~0.3 s。
+
+---
+
+## 四、没有改的部分
+
+`packages/client-rust`、`packages/client-patch` 和其余示例都没动；
+`examples/xiaozhi/src/server.rs` 只改了那一个 buffer_size 常量。
 音箱端二进制直接用上游的，唯一的硬要求是采集格式 `-f S32_LE`。

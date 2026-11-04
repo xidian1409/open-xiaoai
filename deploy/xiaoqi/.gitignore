@@ -13,3 +13,6 @@ bridge/models/encoder.onnx
 bridge/models/decoder.onnx
 bridge/models/joiner.onnx
 bridge/models/silero_vad.onnx
+
+# 原生 TTS 用的 Python 依赖（二进制产物，按 README 4.1.1 现装）
+bridge/pylibs/
