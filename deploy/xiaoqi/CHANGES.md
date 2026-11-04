@@ -68,7 +68,7 @@
 | `bridge/textonly_tts.py` | **只发文字、不合成**的 TTS provider。上游是「先合成再下发文字」，桥接要白等 1.05~1.19 s 的云端合成；换掉之后文字随大模型输出立刻到达 |
 | `bridge/tts_inbox.py` | TTS 水槽服务（`POST /pcm`）：收一段 mibrain 的 mp3，解码成 16 kHz PCM 回给设备写进播放管道，顺手把每段自带的前后静音收拢 |
 | `.config.example.yaml` 里的 `TTS: TextOnly` | 选上面那个 provider，并精简 `Intent.function_call.functions` 到 2 个 |
-| `xiaozhi/plugins/get_weather.py` | 天气插件换成 wttr.in（原实现依赖和风天气，公共 key 已 401） |
+| ~~`xiaozhi/plugins/get_weather.py`~~ | **已摘掉**（2026-11-04）：天气工具每轮要多花 1.5~2.7 s 公网往返，且只答当下实况，接 Hermes 后改用那边的技能/MCP |
 
 ## 三、TTS 输出链路换成原生音色
 

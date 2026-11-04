@@ -318,8 +318,11 @@ start()  → 一条单行 printf 生成 /tmp/xq-sink.sh
 | 文件 | 覆盖到 | 作用 |
 |---|---|---|
 | `bridge/textonly_tts.py` | `/opt/xiaozhi-esp32-server/core/providers/tts/textonly.py` | **只发文字、不合成**的 TTS provider |
-| `xiaozhi/plugins/get_weather.py` | 同名插件 | 天气换成 wttr.in（和风公共 key 已 401） |
 | `xiaozhi/data/.config.yaml` | `/opt/…/data/.config.yaml` | 选择模块、提示词、声纹配置 |
+
+> 天气工具已经摘掉（2026-11-04）：`get_weather` 走 wttr.in 公网，一轮多花 1.5~2.7 s，
+> 而且只答当下实况、答不了"明天"。工具集现在只剩 `get_news_from_newsnow`。
+> 接 Hermes 之后天气改由那边的技能/MCP 提供。
 
 ### 独立服务
 

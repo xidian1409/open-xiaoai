@@ -63,7 +63,7 @@ mkfifo "$DIR.pcm" || exit 1
 echo $$ > "$DIR/sink.pid"
 # -B 200 ms：ALSA 起播门槛跟着变小，首字比默认 500 ms 缓冲快 ~0.3 s；
 # 前面还有 64 KB 命名管道（约 2 s）兜着，实测 3 句连播没有一次 underrun。
-aplay -B 200000 -t raw -f S16_LE -r "$RATE" -c 1 "$DIR.pcm" >"$DIR/aplay.log" 2>&1 &
+nice -n -10 aplay -B 200000 -t raw -f S16_LE -r "$RATE" -c 1 "$DIR.pcm" >"$DIR/aplay.log" 2>&1 &
 AP=$!
 echo $AP > "$DIR/aplay.pid"
 exec 3>"$DIR.pcm" || exit 1
@@ -88,7 +88,9 @@ done
 exec 3>&-
 wait $AP 2>/dev/null
 rm -f "$DIR.pcm"
-echo "underruns=$(grep -c underrun "$DIR/aplay.log" 2>/dev/null)" > "$DIR/finished"
+UR=$(grep -c underrun "$DIR/aplay.log" 2>/dev/null)
+URMAX=$(grep -o "at least [0-9.]*" "$DIR/aplay.log" 2>/dev/null | tail -1)
+echo "underruns=${UR:-0} worst=${URMAX:-none}" > "$DIR/finished"
 """
 
 
@@ -466,7 +468,7 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
                 probe = None
             answer = (probe.stdout or "") if probe is not None else ""
             if answer.startswith("yes"):
-                self._sink_underruns = answer.split("underruns=")[-1].strip()
+                self._sink_underruns = answer.replace("yes:", "", 1).strip()
                 break
             if "dead" in answer:
                 print("⚠️ 播放水槽中途退出，本轮余下音频丢失")
@@ -476,11 +478,19 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
         else:
             print("⚠️ 等待播放结束超时，强制停止")
         elapsed = loop.time() - started
-        underruns = getattr(self, "_sink_underruns", "") or "?"
+        status = getattr(self, "_sink_underruns", "") or "?"
         print(
             f"✅ 原生小爱 TTS 连续播放完成: segs={streamed} "
-            f"尾部排空={elapsed:.3f}s underruns={underruns}"
+            f"尾部排空={elapsed:.3f}s {status}"
         )
+        if not status.startswith("underruns=0"):
+            try:
+                detail = await self.speaker.run_shell(
+                    f"tail -20 {SINK_DIR}/aplay.log 2>/dev/null", timeout=3000
+                )
+                print("🔍 水槽 underrun 明细:\n" + (detail.stdout or "").strip())
+            except Exception:  # noqa: BLE001
+                pass
         await self._sink_cleanup()
 
     async def _sink_cleanup(self) -> None:

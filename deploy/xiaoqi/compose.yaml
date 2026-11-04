@@ -16,8 +16,6 @@ services:
     volumes:
       - ./xiaozhi/data:/opt/xiaozhi-esp32-server/data
       - ./xiaozhi/models:/opt/xiaozhi-esp32-server/models
-      # 用 wttr.in 版天气插件替换镜像里的和风实现（新版 key 需要专属 Host）
-      - ./xiaozhi/plugins/get_weather.py:/opt/xiaozhi-esp32-server/plugins_func/functions/get_weather.py:ro
       # 只发文字、不合成音频的 TTS provider：文字随大模型输出立刻下发，
       # 合成交给音箱本地 mibrain（省掉云端 EdgeTTS 的 1.05~1.19 s/句）
       - ./bridge/textonly_tts.py:/opt/xiaozhi-esp32-server/core/providers/tts/textonly.py:ro

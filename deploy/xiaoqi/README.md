@@ -41,8 +41,7 @@ deploy/xiaoqi/
 │   ├── gen_led_frames.py   # 生成动画帧（本地跑）
 │   └── stop_tts.sh
 └── xiaozhi/                # 小智服务端（xiaozhi-esp32-server）的覆盖层
-    ├── data/.config.example.yaml
-    └── plugins/get_weather.py
+    └── data/.config.example.yaml
 ```
 
 ## 3. 服务与端口
@@ -114,7 +113,6 @@ vi xiaozhi/data/.config.yaml     # 填 DeepSeek api_key、默认城市、声纹�
 `.config.yaml` 里几处必须对上：
 
 - `LLM.DeepSeekLLM.api_key` —— 自己的 Key
-- `plugins.get_weather.default_location` —— 默认城市
 - `voiceprint.url` 必须和 `voiceprint` 服务一致（默认 `http://xiaoqi-voiceprint:8096/voiceprint/identify?key=xiaoqi`）
 - `voiceprint.speakers` 里的 `p_xxxxxxxx` 是**声纹管理页添加人员后生成的 id**，
   人员删了重建要回来改，否则服务端拿不到这个人的名字
