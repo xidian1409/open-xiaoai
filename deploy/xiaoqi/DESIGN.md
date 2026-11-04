@@ -72,13 +72,17 @@ xiaozhi-server：
 ⑤ 服务端 SenseVoice 识别（本地）→ 声纹认人（本地 HTTP）→ DeepSeek 生成
 ⑥ 服务端按标点切句，每句发一条 sentence_start(文字) —— TextOnly provider 不做合成
 ⑦ 桥接收到一句文字 → 立刻起一个 mibrain 合成任务（设备本地，并发上限 4）
-⑧ 第一句合成完 → 桥接让它"整段播"：常驻 mediaplayer 播 file:// 本地文件
-⑨ 后续句子在播放期间并行合成，凑齐后拼接成第二个文件接续播放
-⑩ 播完 → 回到聆听状态（连续对话 5 秒）
+⑧ 桥接同时在设备上拉起一个"水槽"：常驻 aplay + 命名管道（FIFO），回答开始时
+   就绪、整个回答只开一次声卡
+⑨ 第一句合成完 → 桥接把 mp3 路径排进队（只做一个 ln 符号链接），设备上的喂料脚本
+   `curl` 取回 PCM 直接写进管道
+⑩ 后续句子合成一段喂一段，aplay 连续吐给 ALSA —— 句间没有"重开播放器"的动作
+⑪ 桥接排完最后一段落 stop → aplay 排空缓冲退出 → 回到聆听状态（连续对话 5 秒）
 ```
 
-**关键设计**：播放动作完全在设备侧（守护进程读本地文件），桥接只负责"合成 + 调度"，
-所以 NAS 忙、Wi-Fi 抖动、RPC 卡顿都不会让声音断续。
+**关键设计**：一条只开一次声卡的连续音频流。mp3 在设备上合成、在桥接侧解码成
+16 kHz PCM（顺带把每段自带的前后静音收拢），PCM 走局域网 HTTP 回设备写进管道。
+播放期间设备不做任何网络实时性依赖，也不需要每句重启播放器。
 
 ### 2.5 各阶段耗时（实测）
 
@@ -94,10 +98,12 @@ xiaozhi-server：
 | **大模型首字（TTFT）** | **0.83~1.14 s** | DeepSeek，最大的一块 |
 | 大模型出完整回答 | +0.3~1.5 s | 取决于句子数，逐句流式 |
 | 单句合成（mibrain） | 0.08~0.65 s | 设备本地；设备忙时可到 1.2 s |
-| 拼接（cat + wc） | 15~42 ms | 一次 RPC |
-| 起播（常驻 mediaplayer） | < 0.2 s | miplayer 要 0.35 s |
-| **首字延迟（说完→出声）** | **0.88~1.55 s（中位 ~1.2 s）** | 见下方说明 |
-| 段间衔接缝 | ~0.3 s | 落在句子之间，听感接近自然停顿 |
+| 解码 + 静音修剪（桥接） | 20~30 ms/段 | soundfile + numpy |
+| 取回 PCM（设备 curl，局域网） | 60~360 ms/段 | 设备忙时偏慢，但都在"边播边取"里 |
+| 起播（常驻 aplay，已预开） | ~0.2 s | `-B 200000` 后约 0.1~0.2 s |
+| **首字延迟（说完→出声）** | **0.9~1.6 s（中位 ~1.2 s）** | 见下方说明 |
+| **段间衔接缝** | **0 ms** | 单一连续 PCM 流，实测波形连续 |
+| 句间停顿（音频自带） | ~0.17 s | 修剪前是 ~0.65 s（mibrain 每段尾部 ~0.56 s 静音） |
 
 **首字延迟的构成**（典型一轮）：
 
@@ -114,8 +120,14 @@ xiaozhi-server：
 |---|---|---|---|
 | EdgeTTS 流式（原始方案） | ~3.2 s | 无 | 慢在每句 1.05~1.19 s 的云端合成，且逐句串行 |
 | 原生 TTS + 现状服务端 | ~3.9 s | 0.4 s/段 | 最差：在 EdgeTTS 等待上又加了合成和起播 |
-| 原生 TTS + 只发文字 + PCM 实时推流 | ~2.4 s | 断流 | 设备扛不住实时推流，反复 `send stalled` |
-| **原生 TTS + 只发文字 + 整段播放**（现行） | **~1.2 s** | ~0.3 s | 稳定，0 断流 |
+| 原生 TTS + 只发文字 + PCM 实时推流（旧） | ~2.4 s | 断流 | 数据塞进 WebSocket 控制通道，反复 `send stalled` |
+| 原生 TTS + 只发文字 + 整段文件播放 | ~1.2 s | ~0.3 s | 稳定；缝来自"重开播放器"，实测下限就有 0.13 s |
+| **原生 TTS + 只发文字 + 常驻 aplay 连续流**（现行） | **~1.2 s** | **0** | 稳定；3 句连播实测 0 underrun |
+
+**为什么"每句一个文件"注定有缝**：设备上量化过，同一个播放器播第二个文件时，
+从上一段被切断到新文件出声固定有 **~130 ms** 静音（与 mp3/wav、`type`、`group`
+都无关，是播放器自身的启停代价）；再叠上 `sleep(时长 + 0.2 s)` 就是实测的 0.33 s。
+想压到 0.1 s 以下，只能不重开播放器 —— 也就是现在的连续流。
 
 ---
 
@@ -207,14 +219,40 @@ xiaozhi-server：
 | 环节 | 实现 | 为什么 |
 |---|---|---|
 | 合成 | 每句一次 `ubus call mibrain text_to_speech`，4 路并发 | 设备实测：串行 1.28 s，并行 0.35 s；每段少一次 RPC（不再搬文件） |
-| 交付 | 按顺序、合成完一段就交给播放 | "等全部合成完"会让首句干等长回答的最后一句 |
-| 播放 | `cat` 拼成一个 mp3 → `ubus call mediaplayer player_play_url file://…` | 常驻守护进程，起播 < 0.2 s；播放期间设备只读本地文件 |
-| 收尾 | 按估算时长睡（多留 0.2 s） | 轮询状态每次都是一次 RPC，光排队就带来 0.35 s 衔接缝 |
-| 打断 | `player_play_operation {"action":"stop"}` | 比 kill 进程更干脆 |
+| 交付 | 按顺序、合成完一段就排进水槽（一个 `ln -sf`） | "等全部合成完"会让首句干等长回答的最后一句 |
+| 播放 | 设备上常驻 `aplay` + 命名管道；桥接把 mp3 解码成 PCM 回给设备 | 整轮只开一次声卡，段间 0 缝；播放期间不依赖网络实时性 |
+| 停顿归一 | 解码时把每段前后静音收拢（前 30 ms / 后 100 ms） | mibrain 每段自带前 85 ms、后 560 ms 静音，直接拼就是 0.65 s 冷场 |
+| 收尾 | 排完最后一段落 `stop`，等 aplay 排空后落 `finished` | 不用猜时长，播完立刻回到聆听 |
+| 打断 | kill 水槽进程 + `player_play_operation stop` | 管道会立刻断，声音马上停 |
 
-**首句优先**（`XIAOQI_FIRST_SENTENCE_PLAY=1`，默认开）：第一句合成完立刻播，
-其余边播边合成。首字从 ~3 s 降到 ~1.2 s，代价是段间有约 0.3 s 衔接缝。
-不想要这个缝就设成 `0`，回到"整段一次播"（首字 ~3 s，绝对无缝）。
+**流式水槽的细节**（`bridge/tts_inbox.py` 的 `POST /pcm` + `bridge/native_tts_pcm.py`）：
+
+```
+桥接                                   设备
+start()  → 一条单行 printf 生成 /tmp/xq-sink.sh
+         → start-stop-daemon -S -b -x /tmp/xq-sink.sh 192.168.31.190:4398 16000
+                                         ├─ mkfifo /tmp/xq-tts.pcm
+                                         ├─ aplay -q -B 200000 -t raw -f S16_LE -r 16000 -c 1
+                                         └─ 循环看 /tmp/xq-tts/N/<n>
+每段 ln -sf <mp3路径> /tmp/xq-tts/N/<n>  ─→  curl --data-binary @<mp3> http://桥接:4398/pcm
+                                            回应体就是 PCM，直接 >&3 写进管道
+最后 touch /tmp/xq-tts/stop            ─→  关写端 → aplay 排空退出 → touch finished
+桥接轮询 finished（300 ms 一次）         ←┘
+```
+
+几个刻意的选择：
+
+- **脚本用一条 printf 写下去，不用 heredoc**。设备侧命令执行器只适合单行命令。
+- **停止标记在"队列里没有第 n 段"之后才生效**，否则最后一段会被吞掉。
+- **PCM 走 HTTP 不走 WebSocket**。旧方案把 32 KB/s 的数据塞进控制通道，设备忙时
+  直接 `send stalled for 10s`；现在数据走独立连接，控制通道只发一两个字符的命令。
+- **aplay 缓冲设成 200 ms**（默认 500 ms）：起播门槛更小，快 ~0.3 s；前面还有
+  64 KB 管道（约 2 s）兜住，实测 3 句连播 0 underrun。
+- **播放结束不用估时长**：喂料进程关写端后 aplay 会排空退出，落 `finished` 就是
+  真播完了。估时长要么切尾音、要么让"说完"延迟。
+
+**兜底**：`XIAOQI_PLAYBACK_MODE=file` 回到"整段 cat 成文件 + mediaplayer 播"
+（首句优先开关对它有效）。水槽启动失败、或某段排队三次都失败时，本轮回自动降级。
 
 ---
 
@@ -244,7 +282,11 @@ xiaozhi-server：
 | 变量 | 值 | 说明 |
 |---|---|---|
 | `XIAOZHI_TTS_OUTPUT_MODE` | `native_xiaomi` | 覆盖 `tts_output.mode` |
-| `XIAOQI_FIRST_SENTENCE_PLAY` | `1` | 首句优先播放开关 |
+| `XIAOQI_PLAYBACK_MODE` | `stream` | `stream` = 常驻 aplay 连续流（0 缝）；`file` = 整段文件播放（兜底） |
+| `XIAOQI_FIRST_SENTENCE_PLAY` | `1` | 只有 `file` 模式用得到 |
+| `TTS_TRIM_LEAD_MS` / `TTS_TRIM_TAIL_MS` | `30` / `100` | 每段前后静音收拢到多少毫秒（决定句间停顿长短） |
+| `TTS_PCM_RATE` | `16000` | 喂给 aplay 的采样率，必须和 `aplay -r` 一致 |
+| `XIAOQI_REF_DUMP_MARKER` | `/data/logs/ref-dump.on` | 排查用：存在这个文件时把播放回采落成 `ref-dump.pcm` |
 | `PYTHONPATH` | `/app/pylibs` | soundfile/soxr 所在目录 |
 
 ---
@@ -264,7 +306,7 @@ xiaozhi-server：
 | `bridge/config_util.py` | `/app/xiaozhi/utils/config.py` | OTA 带 Client-Id |
 | `bridge/kws_sherpa.py` | `/app/xiaozhi/services/audio/kws/sherpa.py` | 唤醒参数从 config 读 |
 | `bridge/kws_init.py` | `/app/xiaozhi/services/audio/kws/__init__.py` | 唤醒判定日志 + 用检测时刻的状态 |
-| `bridge/native_tts_pcm.py` | `/app/xiaozhi/services/native_tts_pcm.py` | **原生音色播放链路**（并行合成 + 整段播放） |
+| `bridge/native_tts_pcm.py` | `/app/xiaozhi/services/native_tts_pcm.py` | **原生音色播放链路**（并行合成 + 常驻 aplay 连续流） |
 | `bridge/speaker_id.py` | `/app/xiaozhi/speaker_id.py` | 声纹采集/标签 |
 | `bridge/prompt.pcm` | `/app/prompt.pcm` | 「我在」（24k，0.54 s） |
 | `bridge/farewell.pcm` | `/app/farewell.pcm` | 「主人再见，拜拜」（24k，1.51 s） |
@@ -287,7 +329,7 @@ xiaozhi-server：
 | `bridge/speaker_web.py` | 声纹管理页（8097/8444） |
 | `bridge/speaker_lib.py` | 声纹公共逻辑 |
 | `bridge/voiceprint_svc.py` | 声纹识别 HTTP 服务（8096） |
-| `bridge/tts_inbox.py` | TTS 收件服务（4398，当前链路已不使用，保留做备用） |
+| `bridge/tts_inbox.py` | TTS 水槽服务（4398）：`POST /pcm` = mp3 进、PCM 出（含静音收拢） |
 | `bridge/speaker_report.py` | 离线观察工具（聚类/回填） |
 | `bridge/kws_eval.py` / `kws_verify.py` | 唤醒词离线回归 |
 
@@ -349,7 +391,36 @@ xiaozhi-server：
 
 **⑦ 查播放状态不如按时长等。** 每次 `player_get_play_status` 都是一次 RPC，
 光排队就带来 0.35 s 的段间衔接缝；音频是恒定 32 kbps，按时长估算误差只有十几毫秒，
-直接睡更划算。
+直接睡更划算。（这条在改成连续流之前成立；现在收尾改成"等 aplay 排空后落标记"，
+不需要估时长了。）
+
+**⑧ 段间缝的根因不是"等得不够久"，是"重开播放器"。** 用音箱的回采通道
+（ch6/播放回环）量化过：同一个 mediaplayer 播第二个文件时，从上一段被切断到
+新文件出声，固定 **~130 ms** 静音。换 mp3/wav、换 `type`、带 `group`、
+提前/延后触发都改不了；改成设备本地定时触发也只是把 0.33 s 变成 0.13 s。
+只要每句一个文件，就压不到 0.1 s 以下。
+
+**⑨ 顺手排除了三条"看起来更优雅"的路**（都是为了不重开播放器）：
+
+| 想法 | 实测结果 |
+|---|---|
+| 边播边往同一个文件里 `cat >>` | 不行：播放器打开时就定死了长度，后续写入不播 |
+| `miplayer -f <命名管道>` 直接喂 mp3 | 不行：`input error -10102`，它需要可 seek 的输入 |
+| `miplayer --socket <unix socket>` | 设备上没有能写 unix socket 的工具（busybox nc 只支持 TCP），桥接又在 NAS 上连不到 |
+| `mibrain text_to_speech` 加 `play:1` 原生播 | 不能当队列用：异步投递、快速连投会互相覆盖，而且完全无法知道什么时候播完 |
+
+**⑩ 常驻 `aplay` + 命名管道才是零缝隙的正解。** FIFO 里的 PCM 是连续字节流，
+aplay 只开一次 ALSA：两段 1.5 s 的音实测是一条连续的 3005 ms 波形（缝 0）。
+关键配套：aplay 在"回答开始"就预开（阻塞等数据），起播代价被大模型出字掩盖；
+`-B 200000` 让起播门槛从 500 ms 降到 200 ms，又快 ~0.3 s。
+
+**⑪ mibrain 每段自带 0.65 s 静音。** 解码后实测：前导 80~90 ms、结尾 540~570 ms。
+以前"整段 cat 播放"时，每个句号后面就是这 0.65 s 的冷场 —— 用户听到的"停顿长"
+有一半是它，不是衔接缝。现在解码时把前后静音收拢到 30 ms / 100 ms，
+句间停顿归一到 ~0.17 s。
+
+**⑫ mibrain 的 `codec` 参数是摆设。** `pcm`/`wav`/`raw`/`opus`/`aac` 全部返回
+同样的 32 kbps mp3（同样的字节数），所以 PCM 只能在桥接侧解。
 
 ### 6.4 幽灵轮次
 
@@ -396,6 +467,8 @@ AEC 只削 27 dB，Silero 幅度归一化后残留人声照样 0.9+ 分，和真
    会自动重连，但断的瞬间唤醒是死的
 6. **工具调用拖慢首字**：调天气那轮 3.10 s，多出来的全是外部网络往返
 7. **声纹只在每轮开头有效**：服务端要求音频 > 28800 字节（约 0.9 s），太短的句子不认
+8. **连续流依赖设备上的 curl + 喂料进程**：设备极端卡顿时单段 PCM 取回会慢到 0.3 s，
+   但管道里有约 2 s 缓冲，实测没有出现断续；真出问题时本轮回自动降级到文件播放
 
 ---
 
@@ -456,5 +529,10 @@ tar czf backup-$(date +%F).tgz logs xiaozhi/data/.config.yaml bridge
 | miplayer 起播（对照） | ~0.35 s | 11-04 |
 | **首字延迟（纯对话）** | **0.88~1.55 s，中位 ~1.2 s** | 11-04 |
 | 首字延迟（带工具调用） | 3.10 s | 11-04 |
-| 段间衔接缝 | ~0.3 s | 11-04 |
+| 段间衔接缝（旧：每句一个文件） | 0.13 s（播放器重开下限）/ 实测 0.33 s | 11-04 |
+| **段间衔接缝（现行：常驻 aplay 连续流）** | **0 ms** | 11-04 |
+| mibrain 每段自带静音 | 前 85 ms / 后 560 ms | 11-04 |
+| 句间停顿（收拢后） | ~0.17 s | 11-04 |
+| 三句连播 underrun | 0 次（`-B 200000`） | 11-04 |
+| 整轮水槽开销（起播+排空） | ~0.37 s，摊销到整轮 | 11-04 |
 | 稳定性（近 3 小时） | 0 断流 / 0 播放失败 | 11-04 |

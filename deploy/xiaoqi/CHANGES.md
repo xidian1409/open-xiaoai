@@ -32,7 +32,7 @@
 | 文件 | 作用 |
 |---|---|
 | `bridge/speaker_id.py` | 声纹采集 worker：CAM++ 提 192 维 embedding，写 `speakers.jsonl` 和对话日志 |
-| `bridge/native_tts_pcm.py` | **原生音色播放链路**：并行合成（4 路，实测 1.28 s → 0.35 s）、按顺序尽早交付、`cat` 整段拼接、常驻 `mediaplayer` 播放（起播 < 0.2 s）、首句优先开关 |
+| `bridge/native_tts_pcm.py` | **原生音色播放链路**：并行合成（4 路，实测 1.28 s → 0.35 s）、按顺序尽早交付、设备侧常驻 `aplay` + 命名管道连续播放（**段间 0 缝**）；失败自动降级到整段文件播放 |
 | `bridge/gen_keywords.py` | 中文唤醒词 → 拼音 token，生成 `keywords.txt`（绕过镜像里对 `bpe.model` 的依赖） |
 | `bridge/prompt.pcm` / `bridge/farewell.pcm` | 唤醒应答「我在」（0.53 s）与退出语「主人再见，拜拜」（2.23 s），**24 kHz** |
 
@@ -66,6 +66,7 @@
 |---|---|
 | `xiaozhi/data/.config.example.yaml` | 只写需要覆盖的项（模板，`api_key` 等留空） |
 | `bridge/textonly_tts.py` | **只发文字、不合成**的 TTS provider。上游是「先合成再下发文字」，桥接要白等 1.05~1.19 s 的云端合成；换掉之后文字随大模型输出立刻到达 |
+| `bridge/tts_inbox.py` | TTS 水槽服务（`POST /pcm`）：收一段 mibrain 的 mp3，解码成 16 kHz PCM 回给设备写进播放管道，顺手把每段自带的前后静音收拢 |
 | `.config.example.yaml` 里的 `TTS: TextOnly` | 选上面那个 provider，并精简 `Intent.function_call.functions` 到 2 个 |
 | `xiaozhi/plugins/get_weather.py` | 天气插件换成 wttr.in（原实现依赖和风天气，公共 key 已 401） |
 
@@ -78,19 +79,27 @@
 ```
 大模型出句 → 服务端只发文字（TextOnly provider）
           → 桥接每句起一个 mibrain 合成任务（4 路并发）
-          → 合成完一段就按顺序交付
-          → 第一句立刻用常驻 mediaplayer 播；其余边播边合成
-          → 凑齐后 cat 成一个 mp3 接续播放
+          → 回答开始时在设备上拉起常驻 aplay + 命名管道（整轮只开一次声卡）
+          → 合成完一段就排进管道：设备 curl 取回 PCM（桥接解码）直接写进 FIFO
+          → aplay 连续吐给 ALSA，句与句之间不重开播放器
+          → 排完最后一段落 stop，aplay 排空后落 finished
 ```
 
-三条实测结论（详见 DESIGN.md 第 2.5、6.3 节）：
+实测结论（详见 DESIGN.md 第 2.5、6.3 节）：
 
-- **不要实时推 PCM**：设备播音频时 load 6+、可用内存 5 MB，实测反复 `send stalled for 10s`;
-  播放期间让设备只读本地文件才稳
-- **RPC 是稀缺资源**：设备忙时单次 `run_shell` 要 0.3~0.5 s，每段两次 RPC 就是两秒
+- **段间缝的根因是"重开播放器"**：用播放回采通道量过，同一个 mediaplayer 播第二个
+  文件固定有 ~130 ms 静音（换格式/`type`/`group` 都一样）。所以只要"每句一个文件"，
+  无论怎么调触发时机都压不到 0.1 s 以下
+- **零缝的正解是常驻 aplay + FIFO**：同一个 aplay 连续吞 PCM，实测两段音频是一条连续
+  波形（缝 0）；aplay 在回答开始就预开，起播代价被大模型出字盖掉
+- **mibrain 每段自带 0.65 s 静音**（前 85 ms / 后 560 ms）：以前"整段拼接"时每个句号
+  后面都是它，现在解码时收拢到 30 ms / 100 ms，句间停顿 ~0.17 s
+- **数据不要走 WebSocket**：旧方案把 32 KB/s 塞进控制通道，反复 `send stalled for 10s`；
+  现在 PCM 走局域网 HTTP，控制通道只发一两个字符的命令
+- **RPC 是稀缺资源**：设备忙时单次 `run_shell` 要 0.3~0.5 s，每段只用一个 `ln` 排链接
 - **交付时机比合成速度重要**：等全部合成完再播，长回答的首句会被最后一句拖住
 
-效果：首字延迟从 3.2 s 降到 **0.88~1.55 s（中位 ~1.2 s）**，段间缝隙 ~0.3 s。
+效果：首字延迟 **0.88~1.55 s（中位 ~1.2 s）**，段间缝隙 **0**（三句连播 0 underrun）。
 
 ---
 

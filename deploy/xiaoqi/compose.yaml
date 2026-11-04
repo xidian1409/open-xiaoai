@@ -41,12 +41,15 @@ services:
       - XIAOZHI_TTS_OUTPUT_MODE=native_xiaomi
       # soundfile/soxr 装在挂载目录里（镜像里没有 pip，免得为了两个小包重建镜像）
       - PYTHONPATH=/app/pylibs
-      # 首句优先播放：首字从 ~3s 降到 ~1.5s，代价是段间有一次 ~0.3s 衔接缝。
-      # 不想要这个缝就删掉下面这行（或改成 0），回到"整段一次播"。
+      # 播放方式：stream = 设备上常驻 aplay + 命名管道，整轮只开一次声卡，
+      # 句与句之间 0 缝（实测波形连续）；file = 整段 cat 成文件交给 mediaplayer。
+      # stream 起不来时会自动降级成 file。
+      - XIAOQI_PLAYBACK_MODE=stream
+      # 只有 file 模式用得到：首句先播（首字更早，代价是段间 ~0.13s 缝）。
       - XIAOQI_FIRST_SENTENCE_PLAY=1
     ports:
       - "4399:4399"   # 音箱拨入
-      - "4398:4398"   # TTS 收件服务（备用：早期"取回 NAS 解码"方案用的，当前链路不用）
+      - "4398:4398"   # TTS 水槽：设备 POST 一段 mp3，响应体回 PCM（设备 curl 直接写进管道）
       - "4400:4400"   # 本地音乐（先不开，占位）
     volumes:
       - ./bridge/config.py:/app/config.py:ro
@@ -60,7 +63,7 @@ services:
       # 人声续期：任何一帧语音都刷新倒计时
       - ./bridge/vad_hook.py:/app/xiaozhi/services/audio/vad/__init__.py:ro
       - ./bridge/xiaozhi_main.py:/app/xiaozhi/xiaozhi.py:ro
-      # 原生音色播放链路：并行合成 + 按顺序尽早交付 + 整段拼接 + 常驻 mediaplayer 播放
+      # 原生音色播放链路：并行合成 + 按顺序尽早交付 + 常驻 aplay 连续流（0 缝）
       - ./bridge/native_tts_pcm.py:/app/xiaozhi/services/native_tts_pcm.py:ro
       - ./bridge/tts_inbox.py:/app/tts_inbox.py:ro
       - ./bridge/pylibs:/app/pylibs:ro

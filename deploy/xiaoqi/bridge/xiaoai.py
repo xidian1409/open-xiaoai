@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import threading
 import json
 import time
@@ -40,6 +41,12 @@ DEFAULT_ECHO_CAPTURE = {
 # Echo-reference frames older than this mean the speaker stopped sending them.
 ECHO_REFERENCE_STALE_S = 2.0
 
+# 排查"段间缝"用的回环录音开关：存在 /data/logs/ref-dump.on 时，
+# 把音箱回传的播放参考通道（= 扬声器真正在放的东西）原样追加到
+# /data/logs/ref-dump.pcm（48 kHz 单声道 S16），平时零开销。
+REF_DUMP_MARKER = os.environ.get("XIAOQI_REF_DUMP_MARKER", "/data/logs/ref-dump.on")
+REF_DUMP_FILE = os.environ.get("XIAOQI_REF_DUMP_FILE", "/data/logs/ref-dump.pcm")
+
 
 class XiaoAI:
     mode = "xiaoai"
@@ -48,6 +55,8 @@ class XiaoAI:
     echo = None  # SubbandEchoCanceller, created on the first stereo frame
     echo_gain = 1.0
     _echo_seen = None
+    _ref_dump = None
+    _ref_dump_check = 0
     # GlobalStream input up to this sample may still carry (cancelled) playback.
     echo_until = -1
 
@@ -96,10 +105,40 @@ class XiaoAI:
         cls._feed_input(data)
 
     @classmethod
+    def _dump_ref(cls, ref):
+        """把播放回环落盘（见 REF_DUMP_MARKER），用于量起播延迟和段间缝。"""
+        cls._ref_dump_check += 1
+        if cls._ref_dump_check % 25 == 0:  # 约 0.5 秒查一次开关文件
+            alive = os.path.exists(REF_DUMP_MARKER)
+            if alive and cls._ref_dump is None:
+                try:
+                    cls._ref_dump = open(REF_DUMP_FILE, "ab", buffering=0)
+                    # 记下开始时刻（容器内 monotonic），分析端才能把回采波形
+                    # 和桥接侧的日志时间对齐，算出真正的起播延迟。
+                    with open(REF_DUMP_FILE + ".start", "w") as meta:
+                        meta.write(f"{time.monotonic():.3f}")
+                except OSError:
+                    return
+            elif not alive and cls._ref_dump is not None:
+                try:
+                    cls._ref_dump.close()
+                except OSError:
+                    pass
+                cls._ref_dump = None
+                return
+        if cls._ref_dump is None:
+            return
+        try:
+            cls._ref_dump.write(ref.tobytes())
+        except OSError:
+            cls._ref_dump = None
+
+    @classmethod
     def _cancel_echo(cls, data):
         """Stereo [mic, playback] S16 in, the microphone without the
         playback out, as mono S16 at the level the rest expects."""
         frames = np.frombuffer(data, dtype="<i2").reshape(-1, 2)
+        cls._dump_ref(frames[:, 1])
         if cls.echo is None:
             settings = APP_CONFIG.get("barge_in", {}).get("echo_canceller", {})
             cls.echo = SubbandEchoCanceller(
