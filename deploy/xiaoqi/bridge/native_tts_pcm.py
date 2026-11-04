@@ -63,7 +63,7 @@ mkfifo "$DIR.pcm" || exit 1
 echo $$ > "$DIR/sink.pid"
 # -B 200 ms：ALSA 起播门槛跟着变小，首字比默认 500 ms 缓冲快 ~0.3 s；
 # 前面还有 64 KB 命名管道（约 2 s）兜着，实测 3 句连播没有一次 underrun。
-aplay -q -B 200000 -t raw -f S16_LE -r "$RATE" -c 1 "$DIR.pcm" >"$DIR/aplay.log" 2>&1 &
+aplay -B 200000 -t raw -f S16_LE -r "$RATE" -c 1 "$DIR.pcm" >"$DIR/aplay.log" 2>&1 &
 AP=$!
 echo $AP > "$DIR/aplay.pid"
 exec 3>"$DIR.pcm" || exit 1
@@ -82,13 +82,13 @@ while :; do
   elif [ -f "$DIR/stop" ]; then
     break
   else
-    sleep 0.02
+    sleep 0.04
   fi
 done
 exec 3>&-
 wait $AP 2>/dev/null
 rm -f "$DIR.pcm"
-touch "$DIR/finished"
+echo "underruns=$(grep -c underrun "$DIR/aplay.log" 2>/dev/null)" > "$DIR/finished"
 """
 
 
@@ -175,6 +175,7 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
         self._sink_ok = False
         self._sink_count = 0
         self._sink_script_ready = False
+        self._sink_underruns = ""
 
     # ---------- 会话生命周期 ----------
 
@@ -405,6 +406,7 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
                     f"[ -f {SINK_DIR}/ready ] && echo yes", timeout=3000
                 )
                 if "yes" in (probe.stdout or ""):
+                    print(f"🎚️ 播放水槽就绪: {waited + 120}ms")
                     return True
                 await asyncio.sleep(0.1)
                 waited += 130
@@ -452,7 +454,7 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
             print(f"⚠️ 结束水槽失败: {str(error)[:80]}")
         timeout = self.settings.play_timeout_ms
         watched = (
-            f"if [ -f {SINK_DIR}/finished ]; then echo yes; "
+            f"if [ -f {SINK_DIR}/finished ]; then echo yes:$(cat {SINK_DIR}/finished); "
             f"elif ! kill -0 $(cat {SINK_DIR}/sink.pid 2>/dev/null) 2>/dev/null; "
             "then echo dead; fi"
         )
@@ -463,7 +465,8 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
             except Exception:  # noqa: BLE001
                 probe = None
             answer = (probe.stdout or "") if probe is not None else ""
-            if "yes" in answer:
+            if answer.startswith("yes"):
+                self._sink_underruns = answer.split("underruns=")[-1].strip()
                 break
             if "dead" in answer:
                 print("⚠️ 播放水槽中途退出，本轮余下音频丢失")
@@ -473,9 +476,10 @@ class NativeXiaomiTTSPCM(NativeXiaomiTTS):
         else:
             print("⚠️ 等待播放结束超时，强制停止")
         elapsed = loop.time() - started
+        underruns = getattr(self, "_sink_underruns", "") or "?"
         print(
             f"✅ 原生小爱 TTS 连续播放完成: segs={streamed} "
-            f"drain={elapsed:.3f}s（含尾部排空）"
+            f"尾部排空={elapsed:.3f}s underruns={underruns}"
         )
         await self._sink_cleanup()
 
